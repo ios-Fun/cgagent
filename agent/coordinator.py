@@ -4,7 +4,7 @@ import time
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
-from config import Config
+from .config import Config
 from .context import AgentContext
 from .llm_client import LLMClient
 from .token_budget import TokenBudget

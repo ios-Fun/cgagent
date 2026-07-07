@@ -1,0 +1,80 @@
+# Agent Skills Framework 配置文件
+#
+# 这是默认配置文件。你可以复制此文件为 config.local.yaml 进行自定义配置。
+# config.local.yaml 不会被提交到版本控制系统。
+
+# LLM 配置
+llm:
+  # 提供商: openai | anthropic | ollama
+  provider: ollama
+
+  # 模型名称
+  model: Jarcgon/Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-uncenfull
+
+  # API 密钥 (建议在 config.local.yaml 中设置)
+  api_key: your-api-key-here
+
+  # API 基础 URL (可选)
+  base_url: 192.168.0.54
+
+  # 生成参数
+  temperature: 0.7
+  max_tokens: 2000
+  timeout: 60
+
+# Token 预算配置
+budget:
+  total_limit: 100000
+  warning_threshold: 0.8
+  enable_compression: true
+
+# 执行配置
+execution:
+  max_skill_retries: 2
+  enable_streaming: true
+  enable_audit_log: true
+  enable_metrics: true
+  enable_replan: true
+  confidence_threshold: 0.5
+
+# 路径配置
+paths:
+  skills_dir: skills
+
+# 预设配置文件 (profiles)
+# 使用方法: ConfigLoader.load_profile("zhipu_glm47")
+profiles:
+  # 智谱 GLM-4.7
+  zhipu_glm47:
+    llm:
+      provider: anthropic
+      model: glm-4.7
+      base_url: https://open.bigmodel.cn/api/anthropic
+
+  # 智谱 GLM-4-Flash (快速版本)
+  zhipu_flash:
+    llm:
+      provider: anthropic
+      model: glm-4-flash
+      base_url: https://open.bigmodel.cn/api/anthropic
+
+  # OpenAI GPT-4
+  openai_gpt4:
+    llm:
+      provider: openai
+      model: gpt-4
+      base_url: null
+
+  # Anthropic Claude
+  anthropic_claude:
+    llm:
+      provider: anthropic
+      model: claude-3-opus-20240229
+      base_url: null
+
+  # Ollama 本地模型
+  ollama_local:
+    llm:
+      provider: ollama
+      model: llama3
+      base_url: null

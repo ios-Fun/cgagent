@@ -2,9 +2,10 @@
 
 import json
 import time
+import logging
 from typing import List, Optional, Iterator
 from ..llm_base import LLMProvider, LLMMessage, LLMResponse, StreamChunk
-
+logger = logging.getLogger(__name__)
 
 class OllamaProvider(LLMProvider):
     """Ollama provider for running local models."""

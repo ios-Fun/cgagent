@@ -10,6 +10,8 @@ from datetime import datetime
 from app.gateway.schemas import ChatRequest, ChatResponse
 from app.gateway.exceptions import SessionNotFoundException, InvalidRequestException
 from app.gateway.models import Session, ChatHistory
+from agent.config import Config
+from agent.coordinator import Coordinator
 
 router = APIRouter()
 
@@ -38,9 +40,6 @@ async def chat(
     # 调用 Agent 框架处理
     try:
         # 这里集成实际的 Agent Framework
-        from agent.config import Config
-        from agent.coordinator import Coordinator
-
         # 加载配置
         config = Config.from_file()
         coordinator = Coordinator(config)

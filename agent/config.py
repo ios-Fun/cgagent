@@ -108,7 +108,7 @@ class Config:
             Config object
         """
         try:
-            from config_loader import ConfigLoader
+            from agent.config_loader import ConfigLoader
         except ImportError:
             raise ImportError("ConfigLoader not available. Install pyyaml package.")
 
