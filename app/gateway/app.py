@@ -14,12 +14,17 @@ from app.gateway.routers import agent, skills, health
 # from deerflow.config.extensions_config import ExtensionsConfig, get_extensions_config, reload_extensions_config
 # from deerflow.config import app_config as deerflow_app_config
 # get_app_config = deerflow_app_config.get_app_config
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler."""
-
+    logging.getLogger("backend").setLevel(logging.INFO)
     # 启动时初始化
     logger.info("🚀 Agent Framework API 启动中...")
     await init_db()

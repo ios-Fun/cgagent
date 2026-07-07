@@ -18,7 +18,7 @@ class LLMResponse:
     content: str
     model: str
     usage: Dict[str, int]  # {"prompt_tokens": 100, "completion_tokens": 200}
-
+    execution_time_ms: int
 
 @dataclass
 class StreamChunk:

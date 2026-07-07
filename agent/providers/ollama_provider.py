@@ -39,7 +39,7 @@ class OllamaProvider(LLMProvider):
 
         import requests
 
-        payload = {
+        payload= {
             "model": model or self._default_model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
             "stream": False,
@@ -48,7 +48,10 @@ class OllamaProvider(LLMProvider):
                 "num_predict": max_tokens,
             }
         }
-
+        logger.info(f"payload:{payload}")
+        # response = requests.post(
+        #     f"{self.base_url}/api/chat",
+        # )
         start_time = time.time()
         response = requests.post(
             f"{self.base_url}/api/chat",
