@@ -1,6 +1,6 @@
 ---
 name: "device-healthy"
-description: "围绕设备在时间段内的健康状态评估。"
+description: "围绕设备在时间段内的健康状态评估。当用户在询问某个设备的简况状况时使用该SKILL，当用户询问如测点数据或其他模糊问题，忽略此SKILL"
 ---
 
 # Prompt

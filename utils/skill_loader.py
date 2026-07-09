@@ -310,6 +310,10 @@ class SkillLoader:
         """
         if name not in self._skills:
             raise SkillNotFoundError(name)
+            # 增加这行日志，明确告诉你是谁被选中了
+        print(f"[Skill Selected] Agent is using skill: {name}")
+        if name not in self._skills:
+            raise SkillNotFoundError(name)
         return self._skills[name]
 
     def get_all_skills(self) -> Dict[str, Skill]:
@@ -343,6 +347,10 @@ class SkillLoader:
         Returns:
             List of matching skills
         """
+        if trigger not in self._skills:
+            raise SkillNotFoundError(trigger)
+            # 增加这行日志，明确告诉你是谁被选中了
+        print(f"[Skill Selected] Agent is using skill: {trigger}")
         return [
             skill for skill in self._skills.values()
             if skill.matches_trigger(trigger)
