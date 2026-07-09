@@ -5,6 +5,9 @@ import yaml
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+import frontmatter
+import re
+from typing import Dict, Optional
 
 from agent.errors import SkillNotFoundError
 
@@ -21,6 +24,8 @@ class Skill:
     input_schema: Optional[dict] = None
     output_schema: Optional[str] = None
     tools: List[str] = None
+    prompt: str = None
+    workflow: str = None
 
     def __post_init__(self):
         if self.tools is None:
@@ -122,7 +127,8 @@ class SkillLoader:
                 continue
 
             try:
-                skill = self._load_skill_from_md(skill_dir, skill_md)
+                skill = self.load_skill(skill_dir, skill_md)
+                # skill = self._load_skill_from_md(skill_dir, skill_md)
                 self._skills[skill.name] = skill
                 discovered_count += 1
             except Exception as e:
@@ -131,6 +137,109 @@ class SkillLoader:
 
         print(f"SkillLoader: Discovered {discovered_count} skill(s)")
         return self._skills
+
+    def extract_mcps(self, text: str) -> list:
+        """Extract MCPs from text.
+        Args:
+        """
+        pattern = re.compile(r"`([^`]+)`")
+        unique_tools = []
+        for line in text.splitlines():
+            matches = pattern.findall(line)
+            for item in matches:
+                if item not in unique_tools:
+                    unique_tools.append(item)
+        return unique_tools
+
+    def extract_md_section(self, md_text: str, target_h1: str) -> str:
+        """
+        提取Markdown中指定一级标题(# xxx)下的所有内容，直到下一个一级标题为止
+        :param md_text: markdown全文
+        :param target_h1: 目标一级标题文本（如"Prompt"）
+        :return: 章节纯文本，无标题；无匹配返回None
+        """
+        lines = md_text.strip().splitlines()
+        capture = False
+        collect_lines = []
+        # 匹配一级标题 # 标题文本
+        h1_pattern = re.compile(r"^#\s+(.*)$")
+        target_h1_full = f"# {target_h1}"
+
+        for line in lines:
+            h1_match = h1_pattern.match(line)
+            if h1_match:
+                current_title = h1_match.group(1).strip()
+                # 遇到目标标题，开始收集
+                if current_title == target_h1.strip():
+                    capture = True
+                    continue
+                # 遇到其他一级标题，停止收集
+                elif capture:
+                    break
+            # 处于收集状态则追加行
+            if capture:
+                collect_lines.append(line)
+        # 拼接并去除首尾空行
+        section_content = "\n".join(collect_lines).strip()
+        return section_content if section_content else ''
+
+    def load_skill(self, skill_dir: Path, skill_md: Path) -> Skill:
+        """Load a skill by name.
+        Args:
+        """
+
+        content = skill_md.read_text(encoding="utf-8")
+
+        # Parse YAML front matter
+        front_matter = {}
+        document = content
+
+        if content.startswith("---"):
+            parts = content.split("---", 2)
+            if len(parts) >= 2:
+                try:
+                    front_matter = yaml.safe_load(parts[1]) or {}
+                except yaml.YAMLError as e:
+                    raise ValueError(f"Invalid YAML front matter: {e}")
+                document = parts[2] if len(parts) > 2 else ""
+            else:
+                document = content
+
+        # Extract required fields
+        name = front_matter.get("name", skill_dir.name)
+        if not name:
+            raise ValueError(f"Skill name is required in {skill_md}")
+
+        version = front_matter.get("version", "1.0.0")
+        description = front_matter.get("description", "")
+        triggers = front_matter.get("triggers", [])
+        tags = front_matter.get("tags", [])
+        input_schema = front_matter.get("input_schema")
+        output_schema = front_matter.get("output_schema")
+        tools = front_matter.get("Workflow", [])
+
+        doc = frontmatter.load(skill_md)
+        meta = doc.metadata  # 头部yaml元数据 name/description
+        md_body = doc.content  # 正文markdown文本
+
+        # 提取两大章节
+        prompt_content = self.extract_md_section(md_body, "Prompt")
+        workflow_content = self.extract_md_section(md_body, "Workflow")
+        mcps = self.extract_mcps(workflow_content)
+
+        return Skill(
+            name=name,
+            version=version,
+            description=description,
+            triggers=triggers,
+            tags=tags,
+            directory=skill_dir,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            tools=mcps,
+            prompt= prompt_content,
+            workflow= workflow_content
+        )
 
     def _load_skill_from_md(self, skill_dir: Path, skill_md: Path) -> Skill:
         """Load skill metadata from SKILL.md file.
@@ -173,7 +282,7 @@ class SkillLoader:
         tags = front_matter.get("tags", [])
         input_schema = front_matter.get("input_schema")
         output_schema = front_matter.get("output_schema")
-        tools = front_matter.get("tools", [])
+        tools = front_matter.get("Workflow", [])
 
         return Skill(
             name=name,

@@ -13,9 +13,15 @@ from .replanner import RePlanner
 from .skill_executor import SkillExecutor
 from .synthesizer import Synthesizer
 from .tools import ToolRegistry, create_default_registry
-from utils.skill_loader import SkillRegistry
+from utils.skill_loader import SkillRegistry,SkillLoader, Skill
+from app.gateway.config import settings
 from .errors import AgentError, ExecutorError
-
+from dotenv import load_dotenv
+import os
+import logging
+import requests
+import json
+logger = logging.getLogger(__name__)
 
 class Coordinator:
     """Main orchestration coordinator for Agent Skills Framework.
@@ -109,7 +115,7 @@ class Coordinator:
         else:
             raise ValueError(f"Unsupported LLM provider: {provider_name}")
 
-    def process(self, user_input: str, stream: bool = False) -> Dict[str, Any]:
+    async def process(self, user_input: str, stream: bool = False) -> Dict[str, Any]:
         """Process a user request.
 
         Args:
@@ -135,28 +141,29 @@ class Coordinator:
             self.context.write_layer3("tools_registry", self.tools, "coordinator")
 
             # Phase 1: Planning
-            plan = self._plan_execution(user_input)
+            plan = await self._plan_execution(user_input)
 
-            # Phase 2: Execute skills
-            execution_result = self._execute_plan(plan)
-
-            if not execution_result["success"]:
-                return {
-                    "final_response": execution_result.get("error", "Execution failed"),
-                    "success": False,
-                    "metrics": self._get_execution_metrics(start_time)
-                }
-
-            # Phase 3: Synthesize response
-            final_response = self.synthesizer.synthesize(self.context, stream=stream)
-
-            return {
-                "final_response": final_response,
-                "success": True,
-                "metrics": self._get_execution_metrics(start_time),
-                "plan": plan.to_dict(),
-                "execution_summary": execution_result.get("summary", {})
-            }
+            # # Phase 2: Execute skills
+            # execution_result = self._execute_plan(plan)
+            #
+            #
+            # if not execution_result["success"]:
+            #     return {
+            #         "final_response": execution_result.get("error", "Execution failed"),
+            #         "success": False,
+            #         "metrics": self._get_execution_metrics(start_time)
+            #     }
+            #
+            # # Phase 3: Synthesize response
+            # final_response = self.synthesizer.synthesize(self.context, stream=stream)
+            #
+            # return {
+            #     "final_response": final_response,
+            #     "success": True,
+            #     "metrics": self._get_execution_metrics(start_time),
+            #     "plan": plan.to_dict(),
+            #     "execution_summary": execution_result.get("summary", {})
+            # }
 
         except Exception as e:
             return {
@@ -166,7 +173,7 @@ class Coordinator:
                 "error": str(e)
             }
 
-    def _plan_execution(self, user_input: str):
+    async def _plan_execution(self, user_input: str):
         """Generate execution plan.
 
         Args:
@@ -175,19 +182,54 @@ class Coordinator:
         Returns:
             ExecutionPlan
         """
-        self.context.set_component("planner")
+        # 1. rasa进行意图识别, 可以后续替换为大模型进行
+        rasa_url = settings.RASA_URL
+        rasa_data = {
+            "sender": "sender002", "message": user_input
+        }
+        rasa_response = requests.post(url=rasa_url, json=rasa_data, headers={"Content-Type": "application/json"})
+        logging.info(f"rasa_response: {rasa_response.text}")
 
-        available_skills = self.skill_registry.get_all_skills()
-        conversation_history = self.context.read_layer1("conversation_history") or []
+        rasa_obj = rasa_response.text
+        data = json.loads(rasa_obj)
 
-        plan = self.planner.generate_plan(user_input, available_skills, conversation_history)
+        logging.info(f"first: {data[0]}")
+        first_text = data[0]["text"]
+        logging.info(f"first_text: {first_text}")
+        # 2. 返回skills
+        index = int(first_text)
+        loadSkill = settings.SKILLS[index-1]
+        logging.info(f"first_text: {loadSkill}")
 
-        # Store plan in context
-        self.context.write_layer1("execution_plan", plan.to_dict(), "planner")
-        self.context.write_layer1("parsed_intent", plan.intent, "planner")
+        skill_dir = Path(settings.SKILLS_DIR) / loadSkill
+        skill_md = skill_dir / "SKILL.md"
 
-        self._metrics["successful_plans"] += 1
-        return plan
+        skill = SkillRegistry.get_instance().get_skill(loadSkill)
+        logging.info(f"skill: {skill}")
+
+        from agent.mcp.mcptools import get_mcp_tools
+
+        logger.info("Initializing MCP tools...")
+        _mcp_tools_cache = await get_mcp_tools()
+
+        # 执行mcp
+        
+
+        # self.context.set_component("planner")
+        #
+        # available_skills = self.skill_registry.get_all_skills()
+        # conversation_history = self.context.read_layer1("conversation_history") or []
+        #
+        # plan = self.planner.generate_plan(user_input, available_skills, conversation_history)
+        #
+        # # Store plan in context
+        # self.context.write_layer1("execution_plan", plan.to_dict(), "planner")
+        # self.context.write_layer1("parsed_intent", plan.intent, "planner")
+        #
+        # self._metrics["successful_plans"] += 1
+        # return plan
+
+
 
     def _execute_plan(self, plan) -> Dict[str, Any]:
         """Execute all steps in plan.

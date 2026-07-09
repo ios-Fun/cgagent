@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field
 from app.gateway.database import init_db, close_db
 from app.gateway.config import settings
 from app.gateway.routers import agent, skills, health
-
 # from deerflow.config.extensions_config import ExtensionsConfig, get_extensions_config, reload_extensions_config
 # from deerflow.config import app_config as deerflow_app_config
 # get_app_config = deerflow_app_config.get_app_config

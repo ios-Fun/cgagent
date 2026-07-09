@@ -45,7 +45,7 @@ async def chat(
         coordinator = Coordinator(config)
 
         # 处理请求
-        result = coordinator.process(request.message)
+        result = await coordinator.process(request.message)
 
         # 保存历史
         history.append({

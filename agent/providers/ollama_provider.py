@@ -61,6 +61,7 @@ class OllamaProvider(LLMProvider):
         response.raise_for_status()
 
         data = response.json()
+        logger.info(f"data:{data}")
         content = data.get("message", {}).get("content", "")
 
         # Ollama doesn't return token counts, estimate them

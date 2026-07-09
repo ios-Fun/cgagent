@@ -46,6 +46,14 @@ class Settings(BaseSettings):
     DEFAULT_LLM_API_KEY: str = ""
     DEFAULT_LLM_BASE_URL: str = "https://open.bigmodel.cn/api/anthropic"
 
+    RASA_URL: str = "http://192.168.0.106:5005/webhooks/rest/webhook"
+
+    SKILLS: List[str] = [
+        "unit-healthy",
+        "device-healthy",
+        "tag-trend",
+    ]
+
     class Config:
         env_file = ".env"
         case_sensitive = True
