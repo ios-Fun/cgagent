@@ -45,7 +45,7 @@ async def chat(
         coordinator = Coordinator(config)
 
         # 处理请求
-        result = await coordinator.process(request.message)
+        result = await coordinator.process(session_id, request.message)
 
         # 保存历史
         history.append({
@@ -96,9 +96,10 @@ async def chat_stream(
 
             config = Config.from_file()
             coordinator = Coordinator(config)
-
+            # 获取或创建会话
+            session_id = request.session_id
             # 流式处理
-            result = coordinator.process(request.message, stream=True)
+            result = coordinator.process(session_id, request.message, stream=True)
 
             if hasattr(result["final_response"], "__iter__"):
                 for chunk in result["final_response"]:

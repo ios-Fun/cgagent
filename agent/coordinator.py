@@ -4,6 +4,8 @@ import time
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
+from langchain_core.tools import BaseTool
+
 from .config import Config
 from .context import AgentContext
 from .llm_client import LLMClient
@@ -15,6 +17,8 @@ from .synthesizer import Synthesizer
 from .tools import ToolRegistry, create_default_registry
 from utils.skill_loader import SkillRegistry,SkillLoader, Skill
 from app.gateway.config import settings
+from agent.memory.redis_memory import memoryRedis;
+from agent.langchain.llm import generate_context;
 from .errors import AgentError, ExecutorError
 from dotenv import load_dotenv
 import os
@@ -115,7 +119,7 @@ class Coordinator:
         else:
             raise ValueError(f"Unsupported LLM provider: {provider_name}")
 
-    async def process(self, user_input: str, stream: bool = False) -> Dict[str, Any]:
+    async def process(self, session_id: str, user_input: str, stream: bool = False) -> Dict[str, Any]:
         """Process a user request.
 
         Args:
@@ -141,7 +145,9 @@ class Coordinator:
             self.context.write_layer3("tools_registry", self.tools, "coordinator")
 
             # Phase 1: Planning
-            plan = await self._plan_execution(user_input)
+            result = await self._plan_execution(session_id, user_input)
+
+            # 大模型执行结果
 
             # # Phase 2: Execute skills
             # execution_result = self._execute_plan(plan)
@@ -154,16 +160,17 @@ class Coordinator:
             #         "metrics": self._get_execution_metrics(start_time)
             #     }
             #
-            # # Phase 3: Synthesize response
+            # Phase 3: Synthesize response
+            final_response = generate_context(result)
             # final_response = self.synthesizer.synthesize(self.context, stream=stream)
-            #
-            # return {
-            #     "final_response": final_response,
-            #     "success": True,
-            #     "metrics": self._get_execution_metrics(start_time),
-            #     "plan": plan.to_dict(),
-            #     "execution_summary": execution_result.get("summary", {})
-            # }
+
+            return {
+                "final_response": final_response,
+                "success": True,
+                "metrics": self._get_execution_metrics(start_time),
+                # "plan": plan.to_dict(),
+                # "execution_summary": execution_result.get("summary", {})
+            }
 
         except Exception as e:
             return {
@@ -173,7 +180,13 @@ class Coordinator:
                 "error": str(e)
             }
 
-    async def _plan_execution(self, user_input: str):
+    # 查找mcp
+    def find_mcp(self, mcp_name: str, mcp_tools_cache: list) -> Optional[BaseTool]:
+        for mcp in mcp_tools_cache:
+            if mcp_name.endswith(mcp.name):
+                return mcp
+        return None
+    async def _plan_execution(self, session_id: str, user_input: str):
         """Generate execution plan.
 
         Args:
@@ -196,7 +209,7 @@ class Coordinator:
         logging.info(f"first: {data[0]}")
         first_text = data[0]["text"]
         logging.info(f"first_text: {first_text}")
-        # 2. 返回skills
+        # 2. 返回skills, 暂时先只触发一个skill
         index = int(first_text)
         loadSkill = settings.SKILLS[index-1]
         logging.info(f"first_text: {loadSkill}")
@@ -212,9 +225,64 @@ class Coordinator:
         logger.info("Initializing MCP tools...")
         _mcp_tools_cache = await get_mcp_tools()
 
+        # 将结果拼接到字符串
+        result = ""
         # 执行mcp
-        
+        for mcp in skill.tools:
+            logger.info(f"mcp: {mcp}")
+            mcp_tool = self.find_mcp(mcp, _mcp_tools_cache)
+            call_tool_result = None
+            if mcp.endswith("cg_device_healthy") :
+                call_tool_result = await mcp_tool.ainvoke(input={"orginal": user_input, "thread_id": session_id})
+            else:
+                # 查看mcp的参数
+                logger.info(f"mcp: {mcp}")
+                args = mcp_tool.args
+                params = {}
+                for key in args.keys():
+                    if key == "thread_id":
+                        params[key] = session_id
+                    else:
+                        redis_key = f"{session_id}_{key}"
+                        if memoryRedis.has_key(redis_key):
+                            value = memoryRedis.get_cache(redis_key)
+                            params[key] = value
+                call_tool_result = await mcp_tool.ainvoke(input=params)
 
+            logger.info(f"result1: {call_tool_result}")
+
+            # 处理结果
+            text_result = call_tool_result[0]['text']
+            json_result = None
+            try:
+                json_result = json.loads(text_result)
+            except json.JSONDecodeError as e:
+                logger.warning(f"json_result is None:{e}")
+                json_result = None
+            if json_result is not None:
+
+                if len(json_result) == 0:
+                    logger.warn("json_result is 0")
+
+                for key, value in json_result.items():
+                    if key.startswith("cached_"):
+                        redis_key = "";
+                        if session_id is not None:
+                            redis_key = f"{session_id}_{key}"
+                        else:
+                            redis_key = key
+                        memoryRedis.set_cache(redis_key, value)
+                        logger.info(f"memoryRedis set :{redis_key}")
+                if "llmMsg" in json_result:
+                    llmMsg = json_result["llmMsg"]
+                    result += llmMsg
+                else:
+                    result += text_result
+            else:
+                result += text_result
+            result += "\n"
+        logger.info(f"result: {result}")
+        return result
         # self.context.set_component("planner")
         #
         # available_skills = self.skill_registry.get_all_skills()

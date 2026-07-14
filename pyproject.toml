@@ -16,7 +16,8 @@ dependencies = [
     "pyyaml>=6.0.3",
     "requests",
     "python-frontmatter",
-    "langchain_mcp_adapters>=0.2.2"
+    "langchain_mcp_adapters>=0.2.2",
+    "langchain_ollama>=1.1.0"
 ]
 
 
