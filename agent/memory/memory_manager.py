@@ -7,6 +7,8 @@
 import time
 import json
 import hashlib
+import math
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable, Tuple, Set
 from enum import Enum
@@ -127,9 +129,6 @@ class MemoryEntry:
             related_memories=data.get("related_memories", []),
             retention_score=data.get("retention_score", 1.0)
         )
-
-
-import math
 
 
 class MemoryManager:

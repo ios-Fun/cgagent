@@ -206,3 +206,22 @@ class HealthResponse(BaseModel):
     timestamp: str
     database: Optional[str] = None
     redis: Optional[str] = None
+
+
+# ==================== 长期记忆 ====================
+
+class MemoryFactCreateRequest(BaseModel):
+    """手动新增记忆事实"""
+    content: str
+    category: str = "context"
+    confidence: float = 0.9
+    agent_name: Optional[str] = None
+
+
+class MemoryProfileResponse(BaseModel):
+    """用户记忆画像"""
+    user_id: str
+    agent_name: Optional[str] = None
+    memory: Dict[str, Any]
+    fact_count: int
+    injection_preview: Optional[str] = None

@@ -37,12 +37,20 @@ class ExecutionConfig:
     confidence_threshold: float = 0.5
 
 
+def _default_project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _default_skills_dir() -> Path:
+    return _default_project_root() / "skills"
+
+
 @dataclass
 class Config:
     """Global configuration for the Agent Skills Framework."""
     # Project paths
-    project_root: Path = field(default_factory=lambda: Path(__file__).parent)
-    skills_dir: Path = field(default_factory=lambda: Path(__file__).parent / "skills")
+    project_root: Path = field(default_factory=_default_project_root)
+    skills_dir: Path = field(default_factory=_default_skills_dir)
 
     # LLM configuration
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -89,20 +97,20 @@ class Config:
     def validate(self) -> bool:
         """Validate configuration."""
         if not self.llm.api_key:
-            if self.llm.provider in ["openai", "anthropic", "zhipu"]:
+            if self.llm.provider.lower() in ["openai", "anthropic", "zhipu"]:
                 raise ValueError(
                     f"API key required for {self.llm.provider}. "
-                    f"Set LLM_API_KEY environment variable or configure in config.local.yaml"
+                    f"Set LLM_API_KEY environment variable or configure in config.yaml / config.local.yaml"
                 )
         return True
 
     @classmethod
     def from_file(cls, config_path: Optional[str] = None) -> "Config":
-        """Load configuration from YAML file.
+        """Load configuration from project root config.yaml (and optional config.local.yaml).
 
         Args:
             config_path: Optional path to config file.
-                        If not provided, searches for config.local.yaml, then config.yaml
+                        If not provided, loads root config.yaml then config.local.yaml
 
         Returns:
             Config object

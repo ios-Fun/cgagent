@@ -1,227 +1,172 @@
 """Configuration file loader for Agent Skills Framework."""
 
 import os
-import yaml
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+import yaml
+
 from .config import Config, LLMConfig, BudgetConfig, ExecutionConfig
+from .yaml_settings import load_yaml_config, project_root, resolve_path, get_section
 
 
 class ConfigLoader:
-    """Load configuration from YAML file."""
+    """Load configuration from YAML (project root config.yaml preferred)."""
 
-    # 默认配置文件路径
-    DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
-    LOCAL_CONFIG_PATH = Path(__file__).parent / "config.local.yaml"
+    # 兼容旧路径（agent/config.yaml）
+    LEGACY_DEFAULT = Path(__file__).parent / "config.yaml"
+    LEGACY_LOCAL = Path(__file__).parent / "config.local.yaml"
+    ROOT_DEFAULT = project_root() / "config.yaml"
+    ROOT_LOCAL = project_root() / "config.local.yaml"
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> Config:
-        """Load configuration from file.
-
-        Args:
-            config_path: Optional path to config file
-
-        Returns:
-            Config object
-        """
         config = Config()
 
-        # 1. 加载默认配置文件
-        if cls.DEFAULT_CONFIG_PATH.exists():
-            config = cls._load_from_file(cls.DEFAULT_CONFIG_PATH, config)
+        # 1) 根目录统一配置（最高优先级）
+        data = load_yaml_config(config_path)
+        if data:
+            config = cls._apply_dict(data, config)
+        else:
+            # 2) 兼容 agent/ 下旧文件
+            if cls.LEGACY_DEFAULT.exists():
+                config = cls._load_from_file(cls.LEGACY_DEFAULT, config)
+                with open(cls.LEGACY_DEFAULT, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+            if cls.LEGACY_LOCAL.exists():
+                config = cls._load_from_file(cls.LEGACY_LOCAL, config)
+            if config_path:
+                path = Path(config_path)
+                if path.exists():
+                    config = cls._load_from_file(path, config)
 
-        # 2. 加载本地配置文件（覆盖默认配置）
-        if cls.LOCAL_CONFIG_PATH.exists():
-            config = cls._load_from_file(cls.LOCAL_CONFIG_PATH, config)
+        # 3) 仅 YAML 未配置的项，才用环境变量补齐
+        config = cls._load_from_env(config, yaml_data=data or {})
 
-        # 3. 加载用户指定的配置文件
-        if config_path:
-            path = Path(config_path)
-            if path.exists():
-                config = cls._load_from_file(path, config)
-            else:
-                raise FileNotFoundError(f"Config file not found: {config_path}")
+        # 4) ollama 可不校验 api_key
+        try:
+            if config.llm.provider.lower() != "ollama":
+                config.validate()
+        except ValueError:
+            # 允许无 key 时后续组件再失败，避免启动即崩
+            pass
 
-        # 4. 从环境变量加载（覆盖文件配置）
-        config = cls._load_from_env(config)
+        return config
 
-        # 5. 验证配置
-        config.validate()
+    @classmethod
+    def _apply_dict(cls, data: Dict[str, Any], config: Config) -> Config:
+        if "llm" in data and isinstance(data["llm"], dict):
+            llm_data = data["llm"]
+            for key in ("provider", "model", "api_key", "base_url", "temperature", "max_tokens", "timeout"):
+                if key in llm_data and llm_data[key] is not None:
+                    setattr(config.llm, key, llm_data[key])
+
+        if "budget" in data and isinstance(data["budget"], dict):
+            for key in ("total_limit", "warning_threshold", "enable_compression"):
+                if key in data["budget"]:
+                    setattr(config.budget, key, data["budget"][key])
+
+        if "execution" in data and isinstance(data["execution"], dict):
+            for key in (
+                "max_skill_retries",
+                "enable_streaming",
+                "enable_audit_log",
+                "enable_metrics",
+                "enable_replan",
+                "confidence_threshold",
+            ):
+                if key in data["execution"]:
+                    setattr(config.execution, key, data["execution"][key])
+
+        skills_dir = None
+        if "skills" in data and isinstance(data["skills"], dict):
+            skills_dir = data["skills"].get("dir")
+        if "paths" in data and isinstance(data["paths"], dict):
+            skills_dir = data["paths"].get("skills_dir") or skills_dir
+        if skills_dir:
+            config.skills_dir = resolve_path(str(skills_dir))
+        else:
+            # 默认项目根 skills/
+            default_skills = project_root() / "skills"
+            if default_skills.exists():
+                config.skills_dir = default_skills
 
         return config
 
     @classmethod
     def _load_from_file(cls, file_path: Path, config: Config) -> Config:
-        """Load configuration from YAML file.
-
-        Args:
-            file_path: Path to YAML file
-            config: Existing config to update
-
-        Returns:
-            Updated config
-        """
         try:
             with open(file_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-
+                data = yaml.safe_load(f) or {}
             if not data:
                 return config
-
-            # 更新 LLM 配置
-            if "llm" in data:
-                llm_data = data["llm"]
-                if "provider" in llm_data:
-                    config.llm.provider = llm_data["provider"]
-                if "model" in llm_data:
-                    config.llm.model = llm_data["model"]
-                if "api_key" in llm_data:
-                    config.llm.api_key = llm_data["api_key"]
-                if "base_url" in llm_data:
-                    config.llm.base_url = llm_data["base_url"]
-                if "temperature" in llm_data:
-                    config.llm.temperature = llm_data["temperature"]
-                if "max_tokens" in llm_data:
-                    config.llm.max_tokens = llm_data["max_tokens"]
-                if "timeout" in llm_data:
-                    config.llm.timeout = llm_data["timeout"]
-
-            # 更新 Token 预算配置
-            if "budget" in data:
-                budget_data = data["budget"]
-                if "total_limit" in budget_data:
-                    config.budget.total_limit = budget_data["total_limit"]
-                if "warning_threshold" in budget_data:
-                    config.budget.warning_threshold = budget_data["warning_threshold"]
-                if "enable_compression" in budget_data:
-                    config.budget.enable_compression = budget_data["enable_compression"]
-
-            # 更新执行配置
-            if "execution" in data:
-                exec_data = data["execution"]
-                if "max_skill_retries" in exec_data:
-                    config.execution.max_skill_retries = exec_data["max_skill_retries"]
-                if "enable_streaming" in exec_data:
-                    config.execution.enable_streaming = exec_data["enable_streaming"]
-                if "enable_audit_log" in exec_data:
-                    config.execution.enable_audit_log = exec_data["enable_audit_log"]
-                if "enable_metrics" in exec_data:
-                    config.execution.enable_metrics = exec_data["enable_metrics"]
-                if "enable_replan" in exec_data:
-                    config.execution.enable_replan = exec_data["enable_replan"]
-                if "confidence_threshold" in exec_data:
-                    config.execution.confidence_threshold = exec_data["confidence_threshold"]
-
-            # 更新路径配置
-            if "paths" in data:
-                paths_data = data["paths"]
-                if "skills_dir" in paths_data:
-                    config.skills_dir = Path(paths_data["skills_dir"])
-
-            return config
-
+            return cls._apply_dict(data, config)
         except yaml.YAMLError as e:
             raise ValueError(f"Failed to parse config file {file_path}: {e}")
         except Exception as e:
             raise ValueError(f"Failed to load config from {file_path}: {e}")
 
     @classmethod
-    def _load_from_env(cls, config: Config) -> Config:
-        """Load configuration from environment variables (without creating new Config).
+    def _load_from_env(cls, config: Config, yaml_data: Optional[Dict[str, Any]] = None) -> Config:
+        """仅当 YAML 未配置对应项时，才用环境变量补齐。"""
+        yaml_data = yaml_data or {}
+        llm_y = yaml_data.get("llm") if isinstance(yaml_data.get("llm"), dict) else {}
+        budget_y = yaml_data.get("budget") if isinstance(yaml_data.get("budget"), dict) else {}
+        exec_y = yaml_data.get("execution") if isinstance(yaml_data.get("execution"), dict) else {}
+        skills_y = yaml_data.get("skills") if isinstance(yaml_data.get("skills"), dict) else {}
+        paths_y = yaml_data.get("paths") if isinstance(yaml_data.get("paths"), dict) else {}
 
-        Args:
-            config: Existing config to update
+        def missing_llm(key: str) -> bool:
+            return key not in llm_y or llm_y.get(key) in (None, "")
 
-        Returns:
-            Updated config
-        """
-        # LLM configuration
-        if api_key := os.getenv("LLM_API_KEY"):
-            config.llm.api_key = api_key
-        if api_key := os.getenv("OPENAI_API_KEY"):
-            config.llm.api_key = api_key
-        if provider := os.getenv("LLM_PROVIDER"):
+        if missing_llm("api_key"):
+            if api_key := os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY"):
+                config.llm.api_key = api_key
+        if missing_llm("provider") and (provider := os.getenv("LLM_PROVIDER")):
             config.llm.provider = provider
-        if model := os.getenv("LLM_MODEL"):
+        if missing_llm("model") and (model := os.getenv("LLM_MODEL")):
             config.llm.model = model
-        if base_url := os.getenv("LLM_BASE_URL"):
+        if missing_llm("base_url") and (base_url := os.getenv("LLM_BASE_URL")):
             config.llm.base_url = base_url
-        if temperature := os.getenv("LLM_TEMPERATURE"):
+        if missing_llm("temperature") and (temperature := os.getenv("LLM_TEMPERATURE")):
             config.llm.temperature = float(temperature)
 
-        # Token budget
-        if limit := os.getenv("TOKEN_LIMIT"):
+        if "total_limit" not in budget_y and (limit := os.getenv("TOKEN_LIMIT")):
             config.budget.total_limit = int(limit)
-        if warning := os.getenv("TOKEN_WARNING_THRESHOLD"):
+        if "warning_threshold" not in budget_y and (warning := os.getenv("TOKEN_WARNING_THRESHOLD")):
             config.budget.warning_threshold = float(warning)
 
-        # Execution settings
-        if retries := os.getenv("MAX_SKILL_RETRIES"):
+        if "max_skill_retries" not in exec_y and (retries := os.getenv("MAX_SKILL_RETRIES")):
             config.execution.max_skill_retries = int(retries)
-        if enable_replan := os.getenv("ENABLE_REPLAN"):
+        if "enable_replan" not in exec_y and (enable_replan := os.getenv("ENABLE_REPLAN")):
             config.execution.enable_replan = enable_replan.lower() == "true"
 
+        skills_configured = bool(skills_y.get("dir") or paths_y.get("skills_dir"))
+        if not skills_configured and (skills_dir := os.getenv("SKILLS_DIR")):
+            config.skills_dir = resolve_path(skills_dir)
         return config
 
     @classmethod
     def load_profile(cls, profile_name: str) -> Config:
-        """Load a named profile from config file.
-
-        Args:
-            profile_name: Name of the profile (e.g., "zhipu_glm47")
-
-        Returns:
-            Config with profile applied
-        """
-        # 先加载基础配置
-        config = Config()
-
-        # 首先从 config.yaml 加载（包含 profiles 定义）
-        if cls.DEFAULT_CONFIG_PATH.exists():
-            config = cls._load_from_file(cls.DEFAULT_CONFIG_PATH, config)
-
-        # 查找 profile
-        profile_data = None
-        config_files_to_check = [cls.DEFAULT_CONFIG_PATH]
-        if cls.LOCAL_CONFIG_PATH.exists():
-            config_files_to_check.insert(0, cls.LOCAL_CONFIG_PATH)
-
-        for config_file in config_files_to_check:
-            with open(config_file, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-
-            if "profiles" in data and profile_name in data["profiles"]:
-                profile_data = data["profiles"][profile_name]
-                break
-
-        if profile_data is None:
+        config = cls.load()
+        data = load_yaml_config()
+        profiles = data.get("profiles") or {}
+        if profile_name not in profiles:
+            # 兼容旧 agent 配置
+            for path in (cls.LEGACY_LOCAL, cls.LEGACY_DEFAULT):
+                if path.exists():
+                    with open(path, "r", encoding="utf-8") as f:
+                        legacy = yaml.safe_load(f) or {}
+                    profiles = legacy.get("profiles") or {}
+                    if profile_name in profiles:
+                        break
+        if profile_name not in profiles:
             raise ValueError(f"Profile '{profile_name}' not found in config")
-
-        # 应用 profile
-        config = cls._apply_profile(profile_data, config)
-
-        # 最后应用 config.local.yaml 的覆盖（如 API Key）
-        if cls.LOCAL_CONFIG_PATH.exists():
-            config = cls._load_from_file(cls.LOCAL_CONFIG_PATH, config)
-
-        # 应用环境变量覆盖
-        config = cls._load_from_env(config)
-
-        return config
+        profile_data = profiles[profile_name]
+        return cls._apply_profile(profile_data, config)
 
     @classmethod
     def _apply_profile(cls, profile_data: Dict[str, Any], config: Config) -> Config:
-        """Apply profile data to config.
-
-        Args:
-            profile_data: Profile configuration dictionary
-            config: Existing config to update
-
-        Returns:
-            Updated config
-        """
-        # 递归更新配置
         def update_config(section, data):
             if isinstance(data, dict):
                 for key, value in data.items():
@@ -234,69 +179,4 @@ class ConfigLoader:
             update_config(config.budget, profile_data["budget"])
         if "execution" in profile_data:
             update_config(config.execution, profile_data["execution"])
-
         return config
-
-    @classmethod
-    def save_template(cls, output_path: Optional[Path] = None) -> None:
-        """Save a configuration template file.
-
-        Args:
-            output_path: Optional output path (default: config.yaml.template)
-        """
-        if output_path is None:
-            output_path = Path(__file__).parent / "config.yaml.template"
-
-        template = {
-            "llm": {
-                "provider": "anthropic",
-                "model": "glm-4.7",
-                "api_key": "your-api-key-here",
-                "base_url": "https://open.bigmodel.cn/api/anthropic",
-                "temperature": 0.7,
-                "max_tokens": 2000,
-                "timeout": 60
-            },
-            "budget": {
-                "total_limit": 100000,
-                "warning_threshold": 0.8,
-                "enable_compression": True
-            },
-            "execution": {
-                "max_skill_retries": 2,
-                "enable_streaming": True,
-                "enable_audit_log": True,
-                "enable_metrics": True,
-                "enable_replan": True,
-                "confidence_threshold": 0.5
-            },
-            "paths": {
-                "skills_dir": "skills"
-            },
-            "profiles": {
-                "zhipu_glm47": {
-                    "llm": {
-                        "provider": "anthropic",
-                        "model": "glm-4.7",
-                        "base_url": "https://open.bigmodel.cn/api/anthropic"
-                    }
-                },
-                "openai_gpt4": {
-                    "llm": {
-                        "provider": "openai",
-                        "model": "gpt-4"
-                    }
-                },
-                "ollama_local": {
-                    "llm": {
-                        "provider": "ollama",
-                        "model": "llama3"
-                    }
-                }
-            }
-        }
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            yaml.dump(template, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-        print(f"配置模板已保存到: {output_path}")

@@ -119,12 +119,22 @@ class Coordinator:
         else:
             raise ValueError(f"Unsupported LLM provider: {provider_name}")
 
-    async def process(self, session_id: str, user_input: str, stream: bool = False) -> Dict[str, Any]:
+    async def process(
+        self,
+        session_id: str,
+        user_input: str,
+        stream: bool = False,
+        user_id: Optional[str] = None,
+        memory_context: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Process a user request.
 
         Args:
+            session_id: Session id
             user_input: User's request
             stream: Whether to stream the response
+            user_id: User id for long-term memory
+            memory_context: Pre-retrieved long-term memory block for system prompt
 
         Returns:
             Result dictionary with response and metadata
@@ -136,6 +146,10 @@ class Coordinator:
             # Phase 0: Initialize context
             self.context.set_component("coordinator")
             self.context.write_layer1("raw_user_input", user_input, "coordinator")
+            if user_id:
+                self.context.write_layer1("user_id", user_id, "coordinator")
+            if memory_context:
+                self.context.write_layer1("long_term_memory", memory_context, "coordinator")
             self.context.write_layer3(
                 "available_skills",
                 self.skill_registry.get_all_skills(),
@@ -147,29 +161,13 @@ class Coordinator:
             # Phase 1: Planning
             result = await self._plan_execution(session_id, user_input)
 
-            # 大模型执行结果
-
-            # # Phase 2: Execute skills
-            # execution_result = self._execute_plan(plan)
-            #
-            #
-            # if not execution_result["success"]:
-            #     return {
-            #         "final_response": execution_result.get("error", "Execution failed"),
-            #         "success": False,
-            #         "metrics": self._get_execution_metrics(start_time)
-            #     }
-            #
-            # Phase 3: Synthesize response
-            final_response = generate_context(result)
-            # final_response = self.synthesizer.synthesize(self.context, stream=stream)
+            # Phase 3: Synthesize response（注入长期记忆到系统提示词）
+            final_response = generate_context(result, memory_context=memory_context)
 
             return {
                 "final_response": final_response,
                 "success": True,
                 "metrics": self._get_execution_metrics(start_time),
-                # "plan": plan.to_dict(),
-                # "execution_summary": execution_result.get("summary", {})
             }
 
         except Exception as e:

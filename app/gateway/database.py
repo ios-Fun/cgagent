@@ -33,6 +33,11 @@ async def init_db():
         expire_on_commit=False
     )
 
+    # 确保模型已注册到 Base.metadata
+    import app.gateway.models  # noqa: F401
+    import agent.memory.long_term_memory  # noqa: F401
+    import agent.memory.storage  # noqa: F401
+
     # 创建表
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

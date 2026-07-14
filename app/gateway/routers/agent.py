@@ -12,6 +12,7 @@ from app.gateway.exceptions import SessionNotFoundException, InvalidRequestExcep
 from app.gateway.models import Session, ChatHistory
 from agent.config import Config
 from agent.coordinator import Coordinator
+from agent.memory.long_term_memory import get_long_term_memory_service
 
 router = APIRouter()
 
@@ -39,13 +40,37 @@ async def chat(
 
     # 调用 Agent 框架处理
     try:
-        # 这里集成实际的 Agent Framework
-        # 加载配置
+        ltm = get_long_term_memory_service()
+        # 对话开始：加载用户画像并注入系统提示词（deerflow 风格）
+        memory_context = ltm.build_injection_from_profile(user_id=request.user_id)
+        memories = await ltm.retrieve_for_conversation(
+            user_id=request.user_id,
+            user_message=request.message,
+            limit=10,
+        )
+        if not memory_context and memories:
+            memory_context = ltm.build_system_memory_block(memories)
+
         config = Config.from_file()
         coordinator = Coordinator(config)
 
-        # 处理请求
-        result = await coordinator.process(session_id, request.message)
+        result = await coordinator.process(
+            session_id,
+            request.message,
+            user_id=request.user_id,
+            memory_context=memory_context or None,
+        )
+
+        # 异步更新画像（debounce 队列 + LLM，不阻塞主流程）
+        turn_messages = history + [
+            {"role": "user", "content": request.message},
+            {"role": "assistant", "content": result.get("final_response", "")},
+        ]
+        ltm.enqueue_conversation(
+            user_id=request.user_id,
+            messages=turn_messages[-12:],
+            session_id=session_id,
+        )
 
         # 保存历史
         history.append({
@@ -69,11 +94,15 @@ async def chat(
             "last_active": datetime.utcnow().isoformat()
         }
 
+        metrics = result.get("metrics") or {}
+        metrics["long_term_memory_injected"] = bool(memory_context)
+        metrics["memory_facts"] = len(memories)
+
         return ChatResponse(
             response=result["final_response"],
             session_id=session_id,
             success=result.get("success", True),
-            metrics=result.get("metrics")
+            metrics=metrics
         )
 
     except Exception as e:
@@ -94,18 +123,43 @@ async def chat_stream(
             from agent.config import Config
             from agent.coordinator import Coordinator
 
+            session_id = request.session_id or f"session_{uuid.uuid4().hex[:16]}"
+
+            ltm = get_long_term_memory_service()
+            memory_context = ltm.build_injection_from_profile(user_id=request.user_id)
+            memories = await ltm.retrieve_for_conversation(
+                user_id=request.user_id,
+                user_message=request.message,
+                limit=10,
+            )
+            if not memory_context and memories:
+                memory_context = ltm.build_system_memory_block(memories)
+
             config = Config.from_file()
             coordinator = Coordinator(config)
-            # 获取或创建会话
-            session_id = request.session_id
-            # 流式处理
-            result = coordinator.process(session_id, request.message, stream=True)
+            result = await coordinator.process(
+                session_id,
+                request.message,
+                stream=True,
+                user_id=request.user_id,
+                memory_context=memory_context or None,
+            )
 
-            if hasattr(result["final_response"], "__iter__"):
-                for chunk in result["final_response"]:
+            ltm.enqueue_conversation(
+                user_id=request.user_id,
+                messages=[
+                    {"role": "user", "content": request.message},
+                    {"role": "assistant", "content": str(result.get("final_response", ""))},
+                ],
+                session_id=session_id,
+            )
+
+            final = result["final_response"]
+            if hasattr(final, "__iter__") and not isinstance(final, str):
+                for chunk in final:
                     yield f"data: {json.dumps({'chunk': chunk})}\n\n"
             else:
-                yield f"data: {json.dumps({'chunk': result['final_response']})}\n\n"
+                yield f"data: {json.dumps({'chunk': final})}\n\n"
 
             yield "data: [DONE]\n\n"
 
