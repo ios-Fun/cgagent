@@ -3,7 +3,6 @@ name = "cgagent"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "deerflow-harness[ollama]",
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
     "redis>=8.0.1",
@@ -17,7 +16,10 @@ dependencies = [
     "requests",
     "python-frontmatter",
     "langchain_mcp_adapters>=0.2.2",
-    "langchain_ollama>=1.1.0"
+    "langchain_ollama>=1.1.0",
+    "psycopg",
+    "psycopg-binary",
+    "psycopg-pool>=3.3.0",
 ]
 
 

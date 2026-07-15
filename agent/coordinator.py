@@ -25,6 +25,9 @@ import os
 import logging
 import requests
 import json
+import uuid
+from agent.sql.pgsql import execute_sql
+from psycopg import sql
 logger = logging.getLogger(__name__)
 
 class Coordinator:
@@ -141,7 +144,7 @@ class Coordinator:
         """
         start_time = time.time()
         self._metrics["total_requests"] += 1
-
+        run_id = str(uuid.uuid4())
         try:
             # Phase 0: Initialize context
             self.context.set_component("coordinator")
@@ -164,6 +167,9 @@ class Coordinator:
             # Phase 3: Synthesize response（注入长期记忆到系统提示词）
             final_response = generate_context(result, memory_context=memory_context)
 
+            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
+            execute_sql(add_sql, (run_id,session_id,"success", user_input, final_response))
+
             return {
                 "final_response": final_response,
                 "success": True,
@@ -171,6 +177,8 @@ class Coordinator:
             }
 
         except Exception as e:
+            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
+            execute_sql(add_sql, (run_id,session_id,"fail", user_input, str(e)))
             return {
                 "final_response": f"An error occurred: {str(e)}",
                 "success": False,

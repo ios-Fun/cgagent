@@ -33,7 +33,7 @@ async def chat(
     # 获取或创建会话
     session_id = request.session_id
     if not session_id:
-        session_id = f"session_{uuid.uuid4().hex[:16]}"
+        session_id = str(uuid.uuid4())
 
     # 获取历史记录
     history = _chat_history.get(session_id, [])
