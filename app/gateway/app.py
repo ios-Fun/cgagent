@@ -33,6 +33,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     ltm = get_long_term_memory_service()
     await ltm.start()
     logger.info("✅ 长期记忆服务已启动")
+
+    try:
+        from agent.coordinator import Coordinator
+        from agent.mcp.mcptools import get_mcp_tools
+
+        Coordinator.get_shared()
+        tools = await get_mcp_tools()
+        logger.info("✅ MCP tools 预加载完成: %d tool(s)", len(tools))
+    except Exception as e:
+        logger.warning("⚠️ MCP/Coordinator 预加载失败（请求时将重试）: %s", e)
+
     logger.info("🌐 API 服务已启动")
 
     yield
@@ -40,6 +51,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("🛑 Agent Framework API 关闭中...")
     from agent.memory.long_term_memory import get_long_term_memory_service
     await get_long_term_memory_service().stop()
+    try:
+        from agent.mcp.mcptools import reset_mcp_tools_cache
+        from agent.coordinator import Coordinator
+
+        reset_mcp_tools_cache()
+        Coordinator.reset_shared()
+    except Exception:
+        pass
     await close_db()
     logger.info("✅ 清理完成")
 

@@ -51,14 +51,14 @@ async def chat(
         if not memory_context and memories:
             memory_context = ltm.build_system_memory_block(memories)
 
-        config = Config.from_file()
-        coordinator = Coordinator(config)
+        coordinator = Coordinator.get_shared()
 
         result = await coordinator.process(
             session_id,
             request.message,
             user_id=request.user_id,
             memory_context=memory_context or None,
+            mode=getattr(request, "mode", None) or "default",
         )
 
         # 异步更新画像（debounce 队列 + LLM，不阻塞主流程）
@@ -120,7 +120,6 @@ async def chat_stream(
     async def generate():
         """生成流式响应"""
         try:
-            from agent.config import Config
             from agent.coordinator import Coordinator
 
             session_id = request.session_id or f"session_{uuid.uuid4().hex[:16]}"
@@ -135,14 +134,14 @@ async def chat_stream(
             if not memory_context and memories:
                 memory_context = ltm.build_system_memory_block(memories)
 
-            config = Config.from_file()
-            coordinator = Coordinator(config)
+            coordinator = Coordinator.get_shared()
             result = await coordinator.process(
                 session_id,
                 request.message,
                 stream=True,
                 user_id=request.user_id,
                 memory_context=memory_context or None,
+                mode=getattr(request, "mode", None) or "default",
             )
 
             ltm.enqueue_conversation(

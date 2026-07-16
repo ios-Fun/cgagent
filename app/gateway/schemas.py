@@ -102,6 +102,10 @@ class ChatRequest(BaseModel):
     user_id: str = Field(..., description="用户 ID")
     session_id: Optional[str] = Field(None, description="会话 ID，首次可为空")
     stream: bool = Field(False, description="是否流式输出")
+    mode: str = Field(
+        "default",
+        description="执行模式: default=Rasa路由, flash=Plan+多skill执行",
+    )
     context: Optional[Dict[str, Any]] = Field(None, description="额外上下文")
 
 

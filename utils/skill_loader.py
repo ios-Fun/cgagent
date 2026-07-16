@@ -26,10 +26,13 @@ class Skill:
     tools: List[str] = None
     prompt: str = None
     workflow: str = None
+    body: str = None  # full markdown body (constraints live here)
 
     def __post_init__(self):
         if self.tools is None:
             self.tools = []
+        if self.body is None:
+            self.body = ""
 
     @property
     def has_executor(self) -> bool:
@@ -151,37 +154,39 @@ class SkillLoader:
                     unique_tools.append(item)
         return unique_tools
 
-    def extract_md_section(self, md_text: str, target_h1: str) -> str:
+    def extract_md_section(self, md_text: str, target: str) -> str:
+        """Extract section under # / ## / ### title matching target (exact or contains).
+
+        Supports deer-flow style skills like ``## 工作流程 (Workflow)``.
         """
-        提取Markdown中指定一级标题(# xxx)下的所有内容，直到下一个一级标题为止
-        :param md_text: markdown全文
-        :param target_h1: 目标一级标题文本（如"Prompt"）
-        :return: 章节纯文本，无标题；无匹配返回None
-        """
-        lines = md_text.strip().splitlines()
+        lines = (md_text or "").strip().splitlines()
         capture = False
         collect_lines = []
-        # 匹配一级标题 # 标题文本
-        h1_pattern = re.compile(r"^#\s+(.*)$")
-        target_h1_full = f"# {target_h1}"
+        heading_re = re.compile(r"^(#{1,3})\s+(.*)$")
+        target_norm = (target or "").strip().lower()
+        capture_level = None
 
         for line in lines:
-            h1_match = h1_pattern.match(line)
-            if h1_match:
-                current_title = h1_match.group(1).strip()
-                # 遇到目标标题，开始收集
-                if current_title == target_h1.strip():
+            m = heading_re.match(line)
+            if m:
+                level = len(m.group(1))
+                title = m.group(2).strip()
+                title_norm = title.lower()
+                matched = (
+                    title_norm == target_norm
+                    or target_norm in title_norm
+                    or title_norm in target_norm
+                )
+                if matched and not capture:
                     capture = True
+                    capture_level = level
                     continue
-                # 遇到其他一级标题，停止收集
-                elif capture:
+                if capture and capture_level is not None and level <= capture_level:
                     break
-            # 处于收集状态则追加行
             if capture:
                 collect_lines.append(line)
-        # 拼接并去除首尾空行
         section_content = "\n".join(collect_lines).strip()
-        return section_content if section_content else ''
+        return section_content if section_content else ""
 
     def load_skill(self, skill_dir: Path, skill_md: Path) -> Skill:
         """Load a skill by name.
@@ -216,16 +221,25 @@ class SkillLoader:
         tags = front_matter.get("tags", [])
         input_schema = front_matter.get("input_schema")
         output_schema = front_matter.get("output_schema")
-        tools = front_matter.get("Workflow", [])
 
         doc = frontmatter.load(skill_md)
-        meta = doc.metadata  # 头部yaml元数据 name/description
         md_body = doc.content  # 正文markdown文本
 
-        # 提取两大章节
-        prompt_content = self.extract_md_section(md_body, "Prompt")
-        workflow_content = self.extract_md_section(md_body, "Workflow")
-        mcps = self.extract_mcps(workflow_content)
+        # 章节：兼容 # Workflow / ## 工作流程 (Workflow) 等
+        prompt_content = (
+            self.extract_md_section(md_body, "Prompt")
+            or self.extract_md_section(md_body, "角色")
+            or self.extract_md_section(md_body, "目标")
+        )
+        workflow_content = (
+            self.extract_md_section(md_body, "Workflow")
+            or self.extract_md_section(md_body, "工作流程")
+            or self.extract_md_section(md_body, "流程")
+        )
+        # MCP 从全文提取（工具表 + workflow 中的 `tool`）
+        mcps = self.extract_mcps(md_body)
+        if not mcps and workflow_content:
+            mcps = self.extract_mcps(workflow_content)
 
         return Skill(
             name=name,
@@ -237,8 +251,9 @@ class SkillLoader:
             input_schema=input_schema,
             output_schema=output_schema,
             tools=mcps,
-            prompt= prompt_content,
-            workflow= workflow_content
+            prompt=prompt_content or "",
+            workflow=workflow_content or md_body,
+            body=md_body or document or "",
         )
 
     def _load_skill_from_md(self, skill_dir: Path, skill_md: Path) -> Skill:

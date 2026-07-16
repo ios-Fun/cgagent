@@ -53,7 +53,9 @@ llm:
 
 # 对话合成（generate_context）专用，可与上面 llm 不同
 synthesis_llm:
+  provider: "ollama"          # openai | ollama（openai 含 deepseek 等兼容接口）
   model: "Jarcgon/Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-uncenfull"
+  api_key: ""
   base_url: "http://192.168.0.54:11434"
   temperature: 0.4
   max_tokens: 8192

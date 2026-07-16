@@ -37,6 +37,9 @@ class Coordinator:
     4. Synthesizer generates final response
     """
 
+    # Process-level singleton: avoid re-creating LLM client + re-scanning skills every request
+    _shared: Optional["Coordinator"] = None
+
     def __init__(self, config: Config):
         """Initialize Coordinator.
 
@@ -57,9 +60,17 @@ class Coordinator:
         # Initialize tool registry
         self.tools = create_default_registry()
 
-        # Initialize skill registry
+        # Initialize skill registry (singleton; skip rediscover if same dir already loaded)
         self.skill_registry = SkillRegistry.get_instance()
-        self.skill_registry.initialize(str(config.skills_dir))
+        skills_dir = str(config.skills_dir)
+        if not getattr(self.skill_registry, "_loader", None):
+            self.skill_registry.initialize(skills_dir)
+        else:
+            try:
+                # already initialized — keep cached skills
+                _ = self.skill_registry.get_all_skills()
+            except Exception:
+                self.skill_registry.initialize(skills_dir)
 
         # Initialize components
         self.context = AgentContext(enable_audit=config.execution.enable_audit_log)
@@ -79,6 +90,20 @@ class Coordinator:
             "successful_plans": 0,
             "failed_plans": 0
         }
+
+    @classmethod
+    def get_shared(cls, config: Optional[Config] = None) -> "Coordinator":
+        """Reuse one Coordinator per process (recommended for API handlers)."""
+        if cls._shared is None:
+            cfg = config or Config.from_file()
+            cls._shared = cls(cfg)
+            logger.info("Coordinator shared instance created")
+        return cls._shared
+
+    @classmethod
+    def reset_shared(cls) -> None:
+        """Drop shared instance (tests / config reload)."""
+        cls._shared = None
 
     def _create_llm_provider(self):
         """Create LLM provider based on configuration."""
@@ -126,6 +151,7 @@ class Coordinator:
         stream: bool = False,
         user_id: Optional[str] = None,
         memory_context: Optional[str] = None,
+        mode: str = "default",
     ) -> Dict[str, Any]:
         """Process a user request.
 
@@ -135,6 +161,7 @@ class Coordinator:
             stream: Whether to stream the response
             user_id: User id for long-term memory
             memory_context: Pre-retrieved long-term memory block for system prompt
+            mode: Execution mode - "default" (Rasa) or "flash" (Plan + multi-skill Executor)
 
         Returns:
             Result dictionary with response and metadata
@@ -143,7 +170,7 @@ class Coordinator:
         self._metrics["total_requests"] += 1
 
         try:
-            # Phase 0: Initialize context
+            self.context = AgentContext(enable_audit=self.config.execution.enable_audit_log)
             self.context.set_component("coordinator")
             self.context.write_layer1("raw_user_input", user_input, "coordinator")
             if user_id:
@@ -158,16 +185,26 @@ class Coordinator:
             self.context.write_layer3("token_budget", self.llm_client.budget, "coordinator")
             self.context.write_layer3("tools_registry", self.tools, "coordinator")
 
-            # Phase 1: Planning
-            result = await self._plan_execution(session_id, user_input)
+            #   flash   -> multi-skill plan + executor
+            #   default -> Rasa routing
+            mode_norm = (mode or "default").lower()
+            if mode_norm == "flash":
+                result = await self._execution_flash(session_id, user_input)
+            else:
+                result = await self._plan_execution(session_id, user_input)
 
-            # Phase 3: Synthesize response（注入长期记忆到系统提示词）
-            final_response = generate_context(result, memory_context=memory_context)
+            final_response = generate_context(
+                result,
+                memory_context=memory_context,
+                user_input=user_input,
+            )
 
+            metrics = self._get_execution_metrics(start_time)
+            metrics["mode"] = (mode or "default").lower()
             return {
                 "final_response": final_response,
                 "success": True,
-                "metrics": self._get_execution_metrics(start_time),
+                "metrics": metrics,
             }
 
         except Exception as e:
@@ -180,8 +217,10 @@ class Coordinator:
 
     # 查找mcp
     def find_mcp(self, mcp_name: str, mcp_tools_cache: list) -> Optional[BaseTool]:
-        for mcp in mcp_tools_cache:
-            if mcp_name.endswith(mcp.name):
+        from agent.modes.common import tool_name_matches
+        for mcp in mcp_tools_cache or []:
+            name = getattr(mcp, "name", None)
+            if name and tool_name_matches(mcp_name, name):
                 return mcp
         return None
     async def _plan_execution(self, session_id: str, user_input: str):
@@ -295,7 +334,9 @@ class Coordinator:
         # self._metrics["successful_plans"] += 1
         # return plan
 
-
+    async def _execution_flash(self, session_id: str, user_input: str) -> str:
+        from agent.modes.flash import execution_flash
+        return await execution_flash(self, session_id, user_input)
 
     def _execute_plan(self, plan) -> Dict[str, Any]:
         """Execute all steps in plan.

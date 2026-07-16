@@ -34,6 +34,7 @@ DEFAULT_PERMISSIONS = {
             "conversation_history": ContextPermission.READ,
             "parsed_intent": ContextPermission.WRITE,
             "execution_plan": ContextPermission.WRITE,
+            "skill_route": ContextPermission.WRITE,
             "intent": ContextPermission.WRITE
         },
         layer2_scratchpad={},
