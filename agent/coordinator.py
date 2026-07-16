@@ -342,7 +342,9 @@ class Coordinator:
         # self._metrics["successful_plans"] += 1
         # return plan
 
-
+    async def _execution_flash(self, session_id: str, user_input: str) -> str:
+        from agent.modes.flash import execution_flash
+        return await execution_flash(self, session_id, user_input)
 
     def _execute_plan(self, plan) -> Dict[str, Any]:
         """Execute all steps in plan.
