@@ -1,5 +1,6 @@
 from psycopg import sql
 from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row
 
 # 数据库连接参数
 DB_CONFIG = {
@@ -47,7 +48,8 @@ def execute_sql(query: sql.SQL, params: tuple = (), fetch: bool = False):
     :return: 结果/影响行数
     """
     with pool.connection() as conn:
-        with conn.cursor() as cur:
+        # with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(query, params)
             if fetch:
                 return cur.fetchall()

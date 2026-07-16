@@ -236,7 +236,7 @@ class Coordinator:
         # 执行mcp
         for mcp in skill.tools:
             logger.info(f"mcp: {mcp}")
-            mcp_tool = self.find_mcp(mcp, _mcp_tools_cache)
+            mcp_tool = self.find_mcp(mcp.strip(), _mcp_tools_cache)
             call_tool_result = None
             if mcp.endswith("cg_device_healthy") :
                 call_tool_result = await mcp_tool.ainvoke(input={"orginal": user_input, "thread_id": session_id})
