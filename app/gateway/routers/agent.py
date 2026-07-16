@@ -13,12 +13,12 @@ from app.gateway.models import Session, ChatHistory
 from agent.config import Config
 from agent.coordinator import Coordinator
 from agent.memory.long_term_memory import get_long_term_memory_service
-
+from psycopg import sql
+from agent.sql.pgsql import execute_sql
 router = APIRouter()
 
 
 # 简化的内存存储（生产环境应使用数据库）
-_sessions = {}
 _chat_history = {}
 
 
@@ -33,7 +33,7 @@ async def chat(
     # 获取或创建会话
     session_id = request.session_id
     if not session_id:
-        session_id = f"session_{uuid.uuid4().hex[:16]}"
+        session_id = str(uuid.uuid4())
 
     # 获取历史记录
     history = _chat_history.get(session_id, [])
@@ -85,14 +85,6 @@ async def chat(
         })
         _chat_history[session_id] = history
 
-        # 保存会话
-        _sessions[session_id] = {
-            "session_id": session_id,
-            "tenant_id": tenant_id,
-            "user_id": request.user_id,
-            "created_at": datetime.utcnow().isoformat(),
-            "last_active": datetime.utcnow().isoformat()
-        }
 
         metrics = result.get("metrics") or {}
         metrics["long_term_memory_injected"] = bool(memory_context)
@@ -171,10 +163,10 @@ async def chat_stream(
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str):
     """获取会话信息"""
-    session = _sessions.get(session_id)
-    if not session:
-        raise SessionNotFoundException(session_id)
-    return session
+    query_sql = sql.SQL("select * from runs where session_id = {}::text").format(sql.Placeholder())
+
+    result = execute_sql(query_sql, params= (session_id,), fetch=True)
+    return result
 
 
 @router.get("/sessions/{session_id}/history")

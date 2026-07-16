@@ -25,6 +25,9 @@ import os
 import logging
 import requests
 import json
+import uuid
+from agent.sql.pgsql import execute_sql
+from psycopg import sql
 logger = logging.getLogger(__name__)
 
 class Coordinator:
@@ -168,7 +171,7 @@ class Coordinator:
         """
         start_time = time.time()
         self._metrics["total_requests"] += 1
-
+        run_id = str(uuid.uuid4())
         try:
             self.context = AgentContext(enable_audit=self.config.execution.enable_audit_log)
             self.context.set_component("coordinator")
@@ -199,6 +202,9 @@ class Coordinator:
                 user_input=user_input,
             )
 
+            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
+            execute_sql(add_sql, (run_id,session_id,"success", user_input, final_response))
+
             metrics = self._get_execution_metrics(start_time)
             metrics["mode"] = (mode or "default").lower()
             return {
@@ -208,6 +214,8 @@ class Coordinator:
             }
 
         except Exception as e:
+            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
+            execute_sql(add_sql, (run_id,session_id,"fail", user_input, str(e)))
             return {
                 "final_response": f"An error occurred: {str(e)}",
                 "success": False,
@@ -267,7 +275,7 @@ class Coordinator:
         # 执行mcp
         for mcp in skill.tools:
             logger.info(f"mcp: {mcp}")
-            mcp_tool = self.find_mcp(mcp, _mcp_tools_cache)
+            mcp_tool = self.find_mcp(mcp.strip(), _mcp_tools_cache)
             call_tool_result = None
             if mcp.endswith("cg_device_healthy") :
                 call_tool_result = await mcp_tool.ainvoke(input={"orginal": user_input, "thread_id": session_id})
@@ -334,9 +342,7 @@ class Coordinator:
         # self._metrics["successful_plans"] += 1
         # return plan
 
-    async def _execution_flash(self, session_id: str, user_input: str) -> str:
-        from agent.modes.flash import execution_flash
-        return await execution_flash(self, session_id, user_input)
+
 
     def _execute_plan(self, plan) -> Dict[str, Any]:
         """Execute all steps in plan.

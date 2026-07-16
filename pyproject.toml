@@ -18,6 +18,9 @@ dependencies = [
     "python-frontmatter",
     "langchain_mcp_adapters>=0.2.2",
     "langchain_ollama>=1.1.0",
+    "psycopg",
+    "psycopg-binary",
+    "psycopg-pool>=3.3.0",
     "langchain-openai>=0.3.0",
 ]
 
