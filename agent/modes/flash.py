@@ -86,6 +86,7 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
                 mcp_tools_cache=mcp_tools_cache,
                 mcp_catalog=mcp_catalog,
                 intent=route.get("intent") or "",
+                session_history=session_history,
             )
             if adhoc:
                 coordinator._metrics["successful_plans"] += 1
@@ -153,6 +154,7 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
             mcp_tools_cache=mcp_tools_cache,
             mcp_catalog=mcp_catalog,
             intent=route.get("intent") or "",
+            session_history=session_history,
         )
         if adhoc:
             coordinator._metrics["successful_plans"] += 1
@@ -247,17 +249,23 @@ def plan_adhoc_mcps(
     user_input: str,
     mcp_catalog: str,
     intent: str = "",
+    session_history: str = "",
 ) -> Dict[str, Any]:
     """MCP-first path: pick tools for simple data queries."""
     catalog = (mcp_catalog or "")[:6000]
+    history = (session_history or "").strip()
+    if len(history) > 4000:
+        history = history[:4000] + "\n...(history truncated)"
     prompt = f"""你是 MCP 工具路由器。
 你的职责：
-根据用户问题选择最少、最直接满足需求的 MCP 工具。
+根据用户问题与会话历史选择最少、最直接满足需求的 MCP 工具。
 你只负责选择工具，不填写参数，不回答用户。
 用户问题：
 {user_input}
 意图：
 {intent or "未标注"}
+会话历史（多轮追问上下文，可空；可从中继承测点/设备/编码等对象）：
+{history if history else "(空)"}
 可用 MCP 工具目录：
 {catalog}
 规则：
@@ -266,28 +274,29 @@ def plan_adhoc_mcps(
    - 优先选择一个最直接满足需求的工具；
    - 除非用户明确要求综合分析，否则不要选择多个工具；
    - 不为了补充分析而额外调用无关工具。
-3. 如果用户问题属于已有 Skill 流程：
+3. 若当前问题是指代/追问（如「查看所有」「再查一次」「刚才那个」），必须结合会话历史理解对象，不要因当前句缺少实体就 need_tools=false。
+4. 如果用户问题属于已有 Skill 流程：
    - 选择符合 Skill 相关的 MCP，以扩展数据内容；
    - 不自行扩展业务分析流程。
-4. 以下情况：
+5. 以下情况：
    - 闲聊；
    - 概念解释；
    - 无业务数据需求；
-   - 查询对象无法确定；
+   - 查询对象在当前问题与会话历史中都无法确定；
    need_tools=false。
- 6. 不输出 params。
- 7. 只输出 JSON。
- 输出：
- {{
-   "need_tools": false,
-   "reason": "选择原因",
-   "tools": [
-     {{
-       "mcp": "tool_name",
-       "purpose": "调用目的"
-     }}
-   ]
- }}
+6. 不输出 params。
+7. 只输出 JSON。
+输出：
+{{
+  "need_tools": false,
+  "reason": "选择原因",
+  "tools": [
+    {{
+      "mcp": "tool_name",
+      "purpose": "调用目的"
+    }}
+  ]
+}}
 """
     try:
         raw = coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=800)
@@ -324,16 +333,23 @@ async def run_adhoc_mcp(
     mcp_tools_cache: list,
     mcp_catalog: str,
     intent: str = "",
+    session_history: str = "",
 ) -> str:
     """No skill but MCP may fit: select tools -> fill params -> invoke -> answer with evidence."""
     if not mcp_tools_cache:
         return ""
+
+    from agent.memory.message_store import message_store
+
+    if not session_history:
+        session_history = message_store.format_for_prompt(session_id)
 
     plan = plan_adhoc_mcps(
         coordinator,
         user_input=user_input,
         mcp_catalog=mcp_catalog,
         intent=intent,
+        session_history=session_history,
     )
     tools = plan.get("tools") or []
     if not plan.get("need_tools") or not tools:
@@ -345,10 +361,12 @@ async def run_adhoc_mcp(
         [t.get("mcp") for t in tools],
         plan.get("reason"),
     )
-    from agent.memory.message_store import message_store
 
     notes: List[str] = []
     executed: Set[str] = set()
+    history_ctx = (session_history or "").strip()
+    if history_ctx:
+        notes.append(f"[session_history]\n{history_ctx[:4000]}")
 
     for item in tools:
         mcp_name = item.get("mcp") or item.get("tool")
@@ -391,12 +409,16 @@ async def run_adhoc_mcp(
             coordinator._metrics.get("total_skills_executed", 0)
         )
 
-    evidence = build_policy_context(notes, limit=RESULT_SNIPPET_LIMIT)
-    if not _notes_have_tool(notes):
+    # 历史仅用于填参；最终证据包只给 tool/分析，避免挤占合成上下文、干扰成文
+    evidence_notes = [
+        n for n in notes if not (n or "").startswith("[session_history]")
+    ]
+    evidence = build_policy_context(evidence_notes, limit=RESULT_SNIPPET_LIMIT)
+    if not _notes_have_tool(evidence_notes):
         logger.info("flash adhoc: no tool notes")
         return ""
 
-    if not _notes_have_ok(notes):
+    if not _notes_have_ok(evidence_notes):
         # 全失败/全空：仍返回证据，交给合成层据实说明，勿吞成空串走闲聊
         logger.info("flash adhoc: tools ran but no status=ok results")
         return (
@@ -1171,8 +1193,14 @@ def _build_skill_evidence_package(
     draft_final: str = "",
 ) -> str:
     """Package skill run as reference content for the synthesis layer."""
+    # 排除会话历史 / prior：只给合成层本轮 tool 与分析证据
     evidence = build_policy_context(
-        [n for n in notes if not (n or "").startswith("[prior]")],
+        [
+            n
+            for n in notes
+            if not (n or "").startswith("[prior]")
+            and not (n or "").startswith("[session_history]")
+        ],
         limit=RESULT_SNIPPET_LIMIT,
     )
     draft = (draft_final or "").strip()
