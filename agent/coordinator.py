@@ -213,7 +213,7 @@ class Coordinator:
             # 会话储存（redis）
             message_store.append_assistant(session_id, final_response)
 
-            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, user_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
+            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, user_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s,%s, %s, %s, NOW(), NOW())")
             execute_sql(add_sql, (run_id,session_id,user_id, "success", user_input, final_response))
 
             metrics = self._get_execution_metrics(start_time)
@@ -231,7 +231,7 @@ class Coordinator:
                     message_store.append_error(session_id, str(e))
                 except Exception:
                     pass
-            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, user_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
+            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, user_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())")
             execute_sql(add_sql, (run_id,session_id,user_id, "fail", user_input, str(e)))
             return {
                 "final_response": f"An error occurred: {str(e)}",
