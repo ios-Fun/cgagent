@@ -3,8 +3,10 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent.yaml_settings import get_section
-
-
+from langchain_core.output_parsers import JsonOutputParser
+import logging
+from agent.langchain.prompt import PLAN_PROMPT
+logger = logging.getLogger(__name__)
 def _synthesis_settings() -> dict:
     synth = get_section("synthesis_llm")
     llm = get_section("llm")
@@ -86,6 +88,31 @@ def generate_context(
     try:
         response = llm.invoke(messages)
         return response.content
+    except Exception as e:
+        print(f"调用 LLM 失败：{e}")
+        return "调用 LLM 失败"
+
+# 用大模型得到mcp执行计划
+def generate_mcp_plans(workflow_content:str) -> list:
+    cfg = _synthesis_settings()
+    llm = _build_chat_model(cfg)
+    # 从大模型得到执行计划
+    # prompt_content = PLAN_PROMPT.format(workflow_content)
+    messages = [
+        SystemMessage(content=PLAN_PROMPT),
+        HumanMessage(content=workflow_content),
+    ]
+    try:
+        parser = JsonOutputParser()
+
+        response = llm.invoke(messages)
+        logger.info("llm generate_mcp_plans: %s", response.content)
+        data = parser.parse(response.content)
+        tool_list2 = []
+        for item in data:
+            tool_name = item["tool"]
+            tool_list2.append(tool_name)
+        return tool_list2
     except Exception as e:
         print(f"调用 LLM 失败：{e}")
         return "调用 LLM 失败"

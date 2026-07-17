@@ -10,11 +10,16 @@ import re
 from typing import Dict, Optional
 
 from agent.errors import SkillNotFoundError
+from agent.langchain.llm import generate_mcp_plans
 
+# 为0 --从代码， 为1从大模型
+LORD_MCP_TYPER = 0
 
 @dataclass
 class Skill:
     """Skill metadata and configuration."""
+
+
     name: str
     version: str
     description: str
@@ -141,6 +146,7 @@ class SkillLoader:
         print(f"SkillLoader: Discovered {discovered_count} skill(s)")
         return self._skills
 
+
     def extract_mcps(self, text: str) -> list:
         """Extract MCPs from text.
         Args:
@@ -237,9 +243,14 @@ class SkillLoader:
             or self.extract_md_section(md_body, "流程")
         )
         # MCP 从全文提取（工具表 + workflow 中的 `tool`）
-        mcps = self.extract_mcps(md_body)
-        if not mcps and workflow_content:
-            mcps = self.extract_mcps(workflow_content)
+        mcps = []
+        if LORD_MCP_TYPER == 0:
+            mcps = self.extract_mcps(md_body)
+            if not mcps and workflow_content:
+                mcps = self.extract_mcps(workflow_content)
+        else:
+            mcps = generate_mcp_plans(workflow_content)
+
 
         return Skill(
             name=name,
