@@ -13,6 +13,7 @@ from app.gateway.models import Session, ChatHistory
 from agent.config import Config
 from agent.coordinator import Coordinator
 from agent.memory.long_term_memory import get_long_term_memory_service
+from agent.memory.message_store import message_store
 from psycopg import sql
 from agent.sql.pgsql import execute_sql
 router = APIRouter()
@@ -38,10 +39,12 @@ async def chat(
     # 获取历史记录
     history = _chat_history.get(session_id, [])
 
+    # process 前历史 redis
+    history_before = message_store.load(session_id, limit=20)
+
     # 调用 Agent 框架处理
     try:
         ltm = get_long_term_memory_service()
-        # 对话开始：加载用户画像并注入系统提示词（deerflow 风格）
         memory_context = ltm.build_injection_from_profile(user_id=request.user_id)
         memories = await ltm.retrieve_for_conversation(
             user_id=request.user_id,
@@ -61,8 +64,8 @@ async def chat(
             mode=getattr(request, "mode", None) or "default",
         )
 
-        # 异步更新画像（debounce 队列 + LLM，不阻塞主流程）
-        turn_messages = history + [
+        # 异步更新画像（用 process 前快照 + 本轮，不二次 load transcript）
+        turn_messages = history_before + [
             {"role": "user", "content": request.message},
             {"role": "assistant", "content": result.get("final_response", "")},
         ]
@@ -89,6 +92,7 @@ async def chat(
         metrics = result.get("metrics") or {}
         metrics["long_term_memory_injected"] = bool(memory_context)
         metrics["memory_facts"] = len(memories)
+        metrics["session_messages"] = len(message_store.load(session_id))
 
         return ChatResponse(
             response=result["final_response"],
@@ -126,6 +130,9 @@ async def chat_stream(
             if not memory_context and memories:
                 memory_context = ltm.build_system_memory_block(memories)
 
+            # process 前快照，避免 process 写入后再拼 user/assistant 重复
+            history_before = message_store.load(session_id, limit=20)
+
             coordinator = Coordinator.get_shared()
             result = await coordinator.process(
                 session_id,
@@ -138,10 +145,13 @@ async def chat_stream(
 
             ltm.enqueue_conversation(
                 user_id=request.user_id,
-                messages=[
-                    {"role": "user", "content": request.message},
-                    {"role": "assistant", "content": str(result.get("final_response", ""))},
-                ],
+                messages=(
+                    history_before
+                    + [
+                        {"role": "user", "content": request.message},
+                        {"role": "assistant", "content": str(result.get("final_response", ""))},
+                    ]
+                )[-12:],
                 session_id=session_id,
             )
 

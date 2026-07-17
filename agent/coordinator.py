@@ -63,7 +63,7 @@ class Coordinator:
         # Initialize tool registry
         self.tools = create_default_registry()
 
-        # Initialize skill registry (singleton; skip rediscover if same dir already loaded)
+        # Initialize skill registry
         self.skill_registry = SkillRegistry.get_instance()
         skills_dir = str(config.skills_dir)
         if not getattr(self.skill_registry, "_loader", None):
@@ -96,7 +96,7 @@ class Coordinator:
 
     @classmethod
     def get_shared(cls, config: Optional[Config] = None) -> "Coordinator":
-        """Reuse one Coordinator per process (recommended for API handlers)."""
+        """Reuse one Coordinator per process."""
         if cls._shared is None:
             cfg = config or Config.from_file()
             cls._shared = cls(cfg)
@@ -105,7 +105,7 @@ class Coordinator:
 
     @classmethod
     def reset_shared(cls) -> None:
-        """Drop shared instance (tests / config reload)."""
+        """Drop shared instance."""
         cls._shared = None
 
     def _create_llm_provider(self):
@@ -172,6 +172,7 @@ class Coordinator:
         start_time = time.time()
         self._metrics["total_requests"] += 1
         run_id = str(uuid.uuid4())
+        user_appended = False
         try:
             self.context = AgentContext(enable_audit=self.config.execution.enable_audit_log)
             self.context.set_component("coordinator")
@@ -188,6 +189,11 @@ class Coordinator:
             self.context.write_layer3("token_budget", self.llm_client.budget, "coordinator")
             self.context.write_layer3("tools_registry", self.tools, "coordinator")
 
+            # 会话储存（redis）初始化
+            from agent.memory.message_store import message_store
+            message_store.append_user(session_id, user_input)
+            user_appended = True
+
             #   flash   -> multi-skill plan + executor
             #   default -> Rasa routing
             mode_norm = (mode or "default").lower()
@@ -202,6 +208,9 @@ class Coordinator:
                 user_input=user_input,
             )
 
+            # 会话储存（redis）
+            message_store.append_assistant(session_id, final_response)
+
             add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
             execute_sql(add_sql, (run_id,session_id,"success", user_input, final_response))
 
@@ -214,6 +223,12 @@ class Coordinator:
             }
 
         except Exception as e:
+            if user_appended:
+                try:
+                    from agent.memory.message_store import message_store
+                    message_store.append_error(session_id, str(e))
+                except Exception:
+                    pass
             add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
             execute_sql(add_sql, (run_id,session_id,"fail", user_input, str(e)))
             return {

@@ -33,6 +33,13 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
     coordinator.context.set_component("planner")
     logger.info("flash mode: skill routing")
 
+    from agent.memory.message_store import message_store
+
+    session_history = message_store.format_for_prompt(session_id)
+    if session_history:
+        # 仅本地传参用；勿 write_layer1（此时 component=planner，无写权限）
+        logger.info("flash: session history chars=%d", len(session_history))
+
     available_skills = coordinator.skill_registry.get_all_skills()
     mcp_tools_cache = await get_mcp_tools()
     mcp_catalog = format_mcp_catalog(mcp_tools_cache)
@@ -47,7 +54,13 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
             f"{system_inventory}"
         )
 
-    route = route_skills(coordinator, user_input, available_skills, mcp_catalog=mcp_catalog)
+    route = route_skills(
+        coordinator,
+        user_input,
+        available_skills,
+        mcp_catalog=mcp_catalog,
+        session_history=session_history,
+    )
     coordinator.context.write_layer1("skill_route", route, "planner")
     coordinator.context.write_layer1("parsed_intent", route.get("intent", ""), "planner")
 
@@ -124,6 +137,7 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
             mcp_tools_cache=mcp_tools_cache,
             mcp_catalog=mcp_catalog,
             prior_results="\n\n".join(result_parts),
+            session_history=session_history,
         )
         if skill_output:
             result_parts.append(skill_output)
@@ -236,31 +250,44 @@ def plan_adhoc_mcps(
 ) -> Dict[str, Any]:
     """MCP-first path: pick tools for simple data queries."""
     catalog = (mcp_catalog or "")[:6000]
-    prompt = f"""你是 MCP 工具路由器。优先用最少工具直接完成用户取数/查询需求。
-
+    prompt = f"""你是 MCP 工具路由器。
+你的职责：
+根据用户问题选择最少、最直接满足需求的 MCP 工具。
+你只负责选择工具，不填写参数，不回答用户。
 用户问题：
 {user_input}
-
-意图：{intent or "未标注"}
-
+意图：
+{intent or "未标注"}
 可用 MCP 工具目录：
 {catalog}
-
 规则：
 1. 需要业务数据（诊断单、报警、测点、列表、实时值等）且目录有合适工具 → need_tools=true。
-2. 闲聊、概念解释、不需要取数 → need_tools=false。
-3. 优先 1 个工具；最多 {MAX_ADHOC_MCP_CALLS} 个，按调用顺序；mcp 名尽量与目录完全一致。
-4. 用户只查诊断单/列表时，选列表类工具即可，不要为了「分析」多调无关工具。
-5. 不要写 params（执行时再按 schema 填）。
-6. 只输出 JSON。
-
-{{
-  "need_tools": false,
-  "reason": "简述",
+2. 工具选择原则：
+   - 优先选择一个最直接满足需求的工具；
+   - 除非用户明确要求综合分析，否则不要选择多个工具；
+   - 不为了补充分析而额外调用无关工具。
+3. 如果用户问题属于已有 Skill 流程：
+   - 选择符合 Skill 相关的 MCP，以扩展数据内容；
+   - 不自行扩展业务分析流程。
+4. 以下情况：
+   - 闲聊；
+   - 概念解释；
+   - 无业务数据需求；
+   - 查询对象无法确定；
+   need_tools=false。
+6. 不输出 params。
+7. 只输出 JSON。
+输出：
+{
+"need_tools": false,
+  "reason": "选择原因",
   "tools": [
-    {{"mcp": "tool_name", "purpose": "做什么"}}
+    {
+"mcp": "tool_name",
+      "purpose": "调用目的"
+    }
   ]
-}}
+}
 """
     try:
         raw = coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=800)
@@ -318,6 +345,8 @@ async def run_adhoc_mcp(
         [t.get("mcp") for t in tools],
         plan.get("reason"),
     )
+    from agent.memory.message_store import message_store
+
     notes: List[str] = []
     executed: Set[str] = set()
 
@@ -350,6 +379,14 @@ async def run_adhoc_mcp(
         )
         executed.add(real_name)
         notes.append(_format_tool_note(real_name, step_text))
+        # 空/失败也写入，便于追问看到「调过但无数据」
+        status = _classify_tool_result_status(step_text or "")
+        message_store.append_tool(
+            session_id,
+            step_text or f"(empty/error status={status})",
+            name=str(real_name),
+            meta={"path": "adhoc", "purpose": purpose, "status": status},
+        )
         coordinator._metrics["total_skills_executed"] = (
             coordinator._metrics.get("total_skills_executed", 0)
         )
@@ -738,11 +775,15 @@ def plan_skill_execution(
     tools_text: str,
     allowed_tools: List[str],
     prior_results: str = "",
+    session_history: str = "",
 ) -> Dict[str, Any]:
     """One-shot plan for a skill: ordered steps (call_mcp / analyze / stop)."""
     prior = (prior_results or "").strip()
     if len(prior) > 3000:
         prior = prior[:3000] + "\n...(prior truncated)"
+    history = (session_history or "").strip()
+    if len(history) > 4000:
+        history = history[:4000] + "\n...(history truncated)"
     policy_snip = (policy or "")[:8000]
     tools_snip = (tools_text or "")[:6000]
     allow_list = ", ".join(allowed_tools) if allowed_tools else "(all loaded)"
@@ -763,7 +804,10 @@ session_id:
 # 用户问题
 {user_input}
 ---
-# 已有结果
+# 会话历史（多轮追问上下文，可空）
+{history if history else "(空)"}
+---
+# 已有结果（本轮前序 skill / 工具）
 {prior if prior else "(空)"}
 ---
 # 可调用 MCP
@@ -802,6 +846,7 @@ steps 按执行顺序排列。
 - 不重复调用相同工具；
 - 必要前置步骤必须排在前面；
 - 不提前规划依赖前置结果的步骤。
+- 若会话历史已含足够工具/业务结果且用户在追问，可减少重复 call_mcp。
 例如：
 先确认设备存在，
 再查询设备数据。
@@ -954,6 +999,7 @@ async def run_skill_policy2(
     mcp_tools_cache: list,
     mcp_catalog: str,
     prior_results: str = "",
+    session_history: str = "",
 ) -> str:
     """
         -- plan_skill_execution: skill全文 + 用户问题 + prior + 允许MCP → 有序 steps
@@ -963,10 +1009,14 @@ async def run_skill_policy2(
            ├─ stop     → 结束
         -- _build_skill_evidence_package
     """
+    from agent.memory.message_store import message_store
+
     skill_name = getattr(skill, "name", "skill")
     policy = _skill_policy_text(skill)
     allowed_tools = _skill_allowed_tools(skill, mcp_tools_cache)
     allowed_set = set(allowed_tools)
+    if not session_history:
+        session_history = message_store.format_for_prompt(session_id)
 
     allowed_catalog_lines = []
     for tool in mcp_tools_cache or []:
@@ -990,6 +1040,7 @@ async def run_skill_policy2(
         tools_text=tools_text,
         allowed_tools=allowed_tools,
         prior_results=prior_results,
+        session_history=session_history,
     )
     steps = plan.get("steps") or []
     if not steps:
@@ -1004,6 +1055,8 @@ async def run_skill_policy2(
     )
 
     notes: List[str] = []
+    if session_history:
+        notes.append(f"[session_history]\n{session_history[:4000]}")
     if prior_results:
         notes.append(f"[prior]\n{prior_results[:3000]}")
     notes.append(
@@ -1081,6 +1134,18 @@ async def run_skill_policy2(
             )
             executed.add(str(mcp_name))
             notes.append(_format_tool_note(str(mcp_name), step_text))
+            # 空/失败也写入，便于追问看到「调过但无数据」
+            status = _classify_tool_result_status(step_text or "")
+            message_store.append_tool(
+                session_id,
+                step_text or f"(empty/error status={status})",
+                name=str(mcp_name),
+                meta={
+                    "skill": skill_name,
+                    "purpose": purpose,
+                    "status": status,
+                },
+            )
             continue
 
         notes.append(f"[policy] unknown plan action: {action}")
@@ -1469,6 +1534,7 @@ def route_skills(
     user_input: str,
     available_skills: Dict,
     mcp_catalog: str = "",
+    session_history: str = "",
 ) -> Dict[str, Any]:
     skills_desc_lines = []
     for name, skill in (available_skills or {}).items():
@@ -1480,6 +1546,9 @@ def route_skills(
         )
     skills_desc = "\n".join(skills_desc_lines) if skills_desc_lines else "(no skills)"
     catalog_snip = mcp_catalog or ""
+    history_snip = (session_history or "").strip()
+    if len(history_snip) > 3000:
+        history_snip = history_snip[:3000] + "\n...(history truncated)"
 
     prompt = f"""你是问答路径路由器；根据用户问题的业务意图选择最合适的处理路径。
 
@@ -1493,9 +1562,13 @@ def route_skills(
   - 面向具体业务场景、有明确分析流程的，优先 skill；
   - 仅需要调用单一工具获取数据或执行操作的，优先 mcp。
 - 如果用户问题不需要业务数据、不涉及工具能力，则选择 direct。
+- 若会话历史显示用户在追问同一业务对象，优先延续上一轮 path/skill。
 
 用户问题：
 {user_input}
+
+会话历史（可空）：
+{history_snip if history_snip else "(空)"}
 
 可用 Skills（仅 path=skill 时才填 skills）：
 {skills_desc}
