@@ -275,19 +275,19 @@ def plan_adhoc_mcps(
    - 无业务数据需求；
    - 查询对象无法确定；
    need_tools=false。
-6. 不输出 params。
-7. 只输出 JSON。
-输出：
-{
-"need_tools": false,
-  "reason": "选择原因",
-  "tools": [
-    {
-"mcp": "tool_name",
-      "purpose": "调用目的"
-    }
-  ]
-}
+ 6. 不输出 params。
+ 7. 只输出 JSON。
+ 输出：
+ {{
+   "need_tools": false,
+   "reason": "选择原因",
+   "tools": [
+     {{
+       "mcp": "tool_name",
+       "purpose": "调用目的"
+     }}
+   ]
+ }}
 """
     try:
         raw = coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=800)
