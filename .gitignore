@@ -60,3 +60,6 @@ config.yaml.bak
 
 config.local.yaml
 
+agent_framework.db
+agent_framework.db
+*.db
