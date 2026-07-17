@@ -31,6 +31,7 @@ print("数据库连接池初始化完成")
 #     run_id VARCHAR(255) NOT NULL,
 #     session_id VARCHAR(255) NOT NULL,
 #     status VARCHAR(100) NOT NULL,
+#     user_id VARCHAR(255),
 #     first_human_message TEXT,
 #     last_ai_message TEXT,
 #     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
