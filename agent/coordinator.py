@@ -202,8 +202,8 @@ class Coordinator:
                 user_input=user_input,
             )
 
-            add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
-            execute_sql(add_sql, (run_id,session_id,"success", user_input, final_response))
+            # add_sql = sql.SQL("INSERT INTO runs(run_id, session_id, status, first_human_message, last_ai_message, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())")
+            # execute_sql(add_sql, (run_id,session_id,"success", user_input, final_response))
 
             metrics = self._get_execution_metrics(start_time)
             metrics["mode"] = (mode or "default").lower()
@@ -255,7 +255,7 @@ class Coordinator:
         first_text = data[0]["text"]
         logging.info(f"first_text: {first_text}")
         # 2. 返回skills, 暂时先只触发一个skill
-        index = int(first_text)
+        index = int(1)
         loadSkill = settings.SKILLS[index-1]
         logging.info(f"first_text: {loadSkill}")
 
@@ -270,6 +270,7 @@ class Coordinator:
         logger.info("Initializing MCP tools...")
         _mcp_tools_cache = await get_mcp_tools()
 
+        map = {}
         # 将结果拼接到字符串
         result = ""
         # 执行mcp
@@ -289,9 +290,11 @@ class Coordinator:
                         params[key] = session_id
                     else:
                         redis_key = f"{session_id}_{key}"
-                        if memoryRedis.has_key(redis_key):
-                            value = memoryRedis.get_cache(redis_key)
-                            params[key] = value
+                        # if memoryRedis.has_key(redis_key):
+                        #     value = memoryRedis.get_cache(redis_key)
+                        #     params[key] = value
+                        if map.get(key) is not None:
+                            params[key] = map.get(key)
                 call_tool_result = await mcp_tool.ainvoke(input=params)
 
             logger.info(f"result1: {call_tool_result}")
@@ -316,7 +319,8 @@ class Coordinator:
                             redis_key = f"{session_id}_{key}"
                         else:
                             redis_key = key
-                        memoryRedis.set_cache(redis_key, value)
+                        # memoryRedis.set_cache(redis_key, value)
+                        map[key] = value
                         logger.info(f"memoryRedis set :{redis_key}")
                 if "llmMsg" in json_result:
                     llmMsg = json_result["llmMsg"]

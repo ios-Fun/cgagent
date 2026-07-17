@@ -115,8 +115,8 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
             logger.warning("flash: skill %s not found, skip", skill_name)
             continue
 
-        logger.info("flash execute skill-policy=%s", skill_name)
-        skill_output = await run_skill_policy(
+        logger.info("flash execute skill-policy2=%s", skill_name)
+        skill_output = await run_skill_policy2(
             coordinator,
             skill=skill,
             user_input=user_input,
@@ -589,11 +589,13 @@ async def run_skill_policy(
     mcp_catalog: str,
     prior_results: str = "",
 ) -> str:
-    """Execute one skill under SKILL.md constraints (branch / stop / mid-analysis).
-
-    Loop:
-      AI reads full skill policy + cumulative context ->
-        call_mcp | analyze | final_answer | stop
+    """execution_flash
+        └─ for skill: run_skill_policy(...)
+           ├─ decide_skill_next_action   # 每轮就很烦 丢 我要弃用你了
+           ├─ resolve_params_for_mcp
+           ├─ invoke_mcp
+           └─ _build_skill_evidence_package
+        └─ 拼 result_parts
     """
     skill_name = getattr(skill, "name", "skill")
     policy = _skill_policy_text(skill)
@@ -714,6 +716,374 @@ async def run_skill_policy(
 
         # unknown action
         notes.append(f"[policy] unknown action: {action}")
+        break
+
+    return _build_skill_evidence_package(
+        skill_name=skill_name,
+        user_input=user_input,
+        notes=notes,
+        executed=sorted(executed),
+        last_action=last_action,
+        draft_final=final_user_text,
+    )
+
+
+def plan_skill_execution(
+    coordinator: Any,
+    *,
+    skill_name: str,
+    policy: str,
+    user_input: str,
+    session_id: str,
+    tools_text: str,
+    allowed_tools: List[str],
+    prior_results: str = "",
+) -> Dict[str, Any]:
+    """One-shot plan for a skill: ordered steps (call_mcp / analyze / stop)."""
+    prior = (prior_results or "").strip()
+    if len(prior) > 3000:
+        prior = prior[:3000] + "\n...(prior truncated)"
+    policy_snip = (policy or "")[:8000]
+    tools_snip = (tools_text or "")[:6000]
+    allow_list = ", ".join(allowed_tools) if allowed_tools else "(all loaded)"
+
+    prompt = f"""你是技能执行规划器（Skill Execution Planner）。
+你的职责：
+根据 Skill 权威规则、用户问题和已有上下文，为当前 Skill 生成执行计划。
+你只负责规划执行路径，不执行工具，不填写参数，不生成最终答案。
+---
+当前 Skill：
+{skill_name}
+session_id:
+{session_id}
+---
+# Skill 权威规则
+{policy_snip}
+---
+# 用户问题
+{user_input}
+---
+# 已有结果
+{prior if prior else "(空)"}
+---
+# 可调用 MCP
+{tools_snip}
+允许工具：
+{allow_list}
+---
+# 规划原则
+1. Skill 是最高优先级规则。
+必须严格遵守：
+- Workflow；
+- 分支条件；
+- 停止条件；
+- 必要分析步骤。
+禁止：
+- 绕过 Skill；
+- 根据经验添加流程；
+- 调用 Skill 未允许的工具。
+---
+2. 生成执行步骤：
+steps 按执行顺序排列。
+每一步只能是：
+### call_mcp
+表示需要调用工具获取数据。
+要求：
+- mcp 必须来自允许列表；
+- purpose 说明获取什么信息；
+- 不填写 params。
+### analyze
+表示已有数据，需要执行 Skill 要求的分析。
+### stop
+表示无法继续，需要用户补充信息或流程结束。
+---
+3. 规划要求：
+- 优先最少步骤完成目标；
+- 不重复调用相同工具；
+- 必要前置步骤必须排在前面；
+- 不提前规划依赖前置结果的步骤。
+例如：
+先确认设备存在，
+再查询设备数据。
+---
+4. 条件流程：
+如果后续步骤依赖前一步结果，用 condition 描述。
+例如：
+- 查询不到对象 → stop
+- 无诊断数据 → 按 Skill 规则结束或进入补充流程
+---
+5. 不生成：
+- params；
+- 工具返回结果；
+- 最终用户报告。
+---
+6. 只输出合法 JSON，不要 markdown。
+输出格式：
+{{
+  "intent": "用户意图简述",
+  "reason": "规划依据",
+  "steps": [
+    {{
+      "action": "call_mcp",
+      "mcp": "工具名",
+      "purpose": "调用目的",
+      "condition": ""
+    }},
+    {{
+      "action": "analyze",
+      "purpose": "分析目的",
+      "condition": ""
+    }},
+    {{
+      "action": "stop",
+      "reason": "停止原因",
+      "condition": ""
+    }}
+  ]
+}}
+"""
+    try:
+        raw = coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=5000)
+        data = parse_json(raw)
+        if not isinstance(data, dict):
+            raise ValueError("plan is not a dict")
+        steps_raw = data.get("steps") or []
+        if not isinstance(steps_raw, list):
+            steps_raw = []
+        steps: List[Dict[str, Any]] = []
+        for item in steps_raw[:MAX_SKILL_TURNS]:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action") or "").lower().strip()
+            if action not in ("call_mcp", "analyze", "stop", "final_answer", "done"):
+                continue
+            if action in ("final_answer", "done"):
+                action = "stop"
+            step: Dict[str, Any] = {
+                "action": action,
+                "purpose": item.get("purpose") or item.get("reason") or "",
+            }
+            if action == "call_mcp":
+                mcp = item.get("mcp") or item.get("tool")
+                if not mcp:
+                    continue
+                step["mcp"] = str(mcp).strip()
+            if action == "stop":
+                step["reason"] = item.get("reason") or item.get("purpose") or ""
+            steps.append(step)
+        return {
+            "intent": data.get("intent") or "",
+            "reason": data.get("reason") or "",
+            "steps": steps,
+        }
+    except Exception as e:
+        logger.warning("plan_skill_execution failed: %s", e, exc_info=True)
+        return {"intent": "plan_failed", "reason": str(e), "steps": []}
+
+
+def _fallback_steps_from_skill(skill: Any, allowed_tools: List[str]) -> List[Dict[str, Any]]:
+    """If planner fails: call skill tools in order, then stop."""
+    steps: List[Dict[str, Any]] = []
+    declared = list(getattr(skill, "tools", None) or [])
+    pool = allowed_tools or []
+    from agent.modes.common import tool_name_matches
+
+    for d in declared:
+        if not d or not isinstance(d, str):
+            continue
+        matched = next((a for a in pool if tool_name_matches(d, a)), None)
+        if matched is None and d in pool:
+            matched = d
+        if matched and not any(s.get("mcp") == matched for s in steps):
+            steps.append({
+                "action": "call_mcp",
+                "mcp": matched,
+                "purpose": f"from skill {getattr(skill, 'name', '')} default order",
+            })
+        if len(steps) >= MAX_SKILL_TURNS:
+            break
+    if not steps and pool:
+        # last resort: first allowed tool only
+        steps.append({
+            "action": "call_mcp",
+            "mcp": pool[0],
+            "purpose": "fallback single tool",
+        })
+    steps.append({"action": "stop", "reason": "fallback plan end"})
+    return steps[:MAX_SKILL_TURNS]
+
+
+def _analyze_under_plan(
+    coordinator: Any,
+    *,
+    skill_name: str,
+    policy: str,
+    user_input: str,
+    purpose: str,
+    context: str,
+) -> str:
+    """Optional mid-plan analysis (one short LLM call)."""
+    ctx = (context or "")[:10000]
+    pol = (policy or "")[:5000]
+    prompt = f"""你是技能中间分析器。按 Skill 规则与已有工具结果做简短分析摘要（中文，≤1000字）。
+不要编造工具未返回的数据。只输出分析正文，不要 JSON。
+要注重数值型数据，最好输出要带原值。
+Skill: {skill_name}
+用户问题: {user_input}
+本步目的: {purpose or "(综合分析)"}
+
+Skill 规则摘录:
+{pol}
+
+已有上下文:
+{ctx if ctx else "(空)"}
+"""
+    try:
+        return (coordinator.llm_client.invoke(prompt, temperature=0.2, max_tokens=1200) or "").strip()
+    except Exception as e:
+        logger.warning("plan analyze failed: %s", e)
+        return ""
+
+
+async def run_skill_policy2(
+    coordinator: Any,
+    *,
+    skill: Any,
+    user_input: str,
+    session_id: str,
+    mcp_tools_cache: list,
+    mcp_catalog: str,
+    prior_results: str = "",
+) -> str:
+    """
+        -- plan_skill_execution: skill全文 + 用户问题 + prior + 允许MCP → 有序 steps
+        -- 按 steps 执行
+           ├─ call_mcp → resolve_params_for_mcp(AI填参) → invoke_mcp
+           ├─ analyze  → 短 LLM 摘要（可选）
+           ├─ stop     → 结束
+        -- _build_skill_evidence_package
+    """
+    skill_name = getattr(skill, "name", "skill")
+    policy = _skill_policy_text(skill)
+    allowed_tools = _skill_allowed_tools(skill, mcp_tools_cache)
+    allowed_set = set(allowed_tools)
+
+    allowed_catalog_lines = []
+    for tool in mcp_tools_cache or []:
+        name = getattr(tool, "name", str(tool))
+        if name in allowed_set or any(
+            name.endswith(a) or a.endswith(name) for a in allowed_tools
+        ):
+            desc = (getattr(tool, "description", None) or "")[:160]
+            args = format_tool_args_for_prompt(tool)
+            allowed_catalog_lines.append(f"- {name}: {desc}\n  args: {args}")
+    tools_text = "\n".join(allowed_catalog_lines) if allowed_catalog_lines else (
+        "allowed tool names: " + ", ".join(allowed_tools)
+    )
+
+    plan = plan_skill_execution(
+        coordinator,
+        skill_name=skill_name,
+        policy=policy,
+        user_input=user_input,
+        session_id=session_id,
+        tools_text=tools_text,
+        allowed_tools=allowed_tools,
+        prior_results=prior_results,
+    )
+    steps = plan.get("steps") or []
+    if not steps:
+        logger.warning("flash skill=%s empty plan; fallback tool order", skill_name)
+        steps = _fallback_steps_from_skill(skill, allowed_tools)
+    logger.info(
+        "flash skill=%s plan intent=%s steps=%s reason=%s",
+        skill_name,
+        (plan.get("intent") or "")[:80],
+        [(s.get("action"), s.get("mcp")) for s in steps],
+        (plan.get("reason") or "")[:120],
+    )
+
+    notes: List[str] = []
+    if prior_results:
+        notes.append(f"[prior]\n{prior_results[:3000]}")
+    notes.append(
+        f"[plan]\nintent={plan.get('intent') or ''}\n"
+        f"reason={plan.get('reason') or ''}\n"
+        f"steps={[(s.get('action'), s.get('mcp'), s.get('purpose')) for s in steps]}"
+    )
+
+    executed: Set[str] = set()
+    last_action = ""
+    final_user_text = ""
+
+    for i, step in enumerate(steps, start=1):
+        action = (step.get("action") or "").lower().strip()
+        last_action = action
+        purpose = step.get("purpose") or step.get("reason") or ""
+        context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
+        logger.info(
+            "flash skill=%s plan-step=%d/%d action=%s mcp=%s",
+            skill_name,
+            i,
+            len(steps),
+            action,
+            step.get("mcp") or "",
+        )
+
+        if action in ("stop", "final_answer", "done"):
+            final_user_text = (step.get("reason") or purpose or "").strip()
+            if final_user_text:
+                notes.append(f"[final]\n{final_user_text}")
+            break
+
+        if action == "analyze":
+            analysis = _analyze_under_plan(
+                coordinator,
+                skill_name=skill_name,
+                policy=policy,
+                user_input=user_input,
+                purpose=purpose,
+                context=context,
+            )
+            if analysis:
+                notes.append(f"[analysis]\n{analysis}")
+            continue
+
+        if action == "call_mcp":
+            mcp_name = step.get("mcp") or step.get("tool")
+            if not mcp_name:
+                notes.append("[policy] call_mcp missing tool name, skip")
+                continue
+            if allowed_tools and not any(
+                mcp_name == a or mcp_name.endswith(a) or a.endswith(mcp_name)
+                for a in allowed_tools
+            ):
+                logger.warning("flash skill=%s blocked mcp=%s", skill_name, mcp_name)
+                notes.append(f"[policy] tool not allowed by skill: {mcp_name}")
+                continue
+
+            params = resolve_params_for_mcp(
+                coordinator,
+                mcp_name=mcp_name,
+                mcp_tools_cache=mcp_tools_cache,
+                user_input=user_input,
+                session_id=session_id,
+                purpose=purpose,
+                accumulated_results=context,
+            )
+            step_text = await invoke_mcp(
+                coordinator,
+                session_id=session_id,
+                user_input=user_input,
+                mcp_name=mcp_name,
+                mcp_tools_cache=mcp_tools_cache,
+                params_hint=params,
+            )
+            executed.add(str(mcp_name))
+            notes.append(_format_tool_note(str(mcp_name), step_text))
+            continue
+
+        notes.append(f"[policy] unknown plan action: {action}")
         break
 
     return _build_skill_evidence_package(
