@@ -46,3 +46,19 @@ PLAN_PROMPT1 = '''
   }
 ]
 '''
+
+# INTENT_PROMPT = '''
+# 你是一个意图分类器。分析用户输入，识别其中包含的所有意图场景。
+#
+# 场景列表：
+# {}
+#
+# 规则：
+# 1. 返回 JSON，格式：{"scenes":["场景ID1","场景ID2",...],"composite":true/false}
+# 2. 如果用户只有单一意图：{"scenes":["场景ID"],"composite":false}
+# 3. 如果用户有多个意图（如"审查代码并优化性能再写文档"）：{"scenes":["review","perf","doc"],"composite":true}
+# 4. scenes 数组按主次顺序排列，最重要的在前面，最多 5 个
+# 5. 如果都不太匹配，返回 {"scenes":["optimize"],"composite":false}
+# 6. 不要返回任何其他文字，只返回 JSON`;
+#
+# '''

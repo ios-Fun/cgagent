@@ -17,8 +17,9 @@ from .synthesizer import Synthesizer
 from .tools import ToolRegistry, create_default_registry
 from utils.skill_loader import SkillRegistry,SkillLoader, Skill
 from app.gateway.config import settings
-from agent.memory.redis_memory import memoryRedis;
-from agent.langchain.llm import generate_context;
+from agent.memory.redis_memory import memoryRedis
+from agent.langchain.llm import generate_context,generate_intents
+# from agent.langchain.prompt import INTENT_PROMPT
 from .errors import AgentError, ExecutorError
 from dotenv import load_dotenv
 import os
@@ -29,6 +30,9 @@ import uuid
 from agent.sql.pgsql import execute_sql
 from psycopg import sql
 logger = logging.getLogger(__name__)
+
+# 0--rasa, 1--LLM
+INTENT_TYPE = 1
 
 class Coordinator:
     """Main orchestration coordinator for Agent Skills Framework.
@@ -257,106 +261,140 @@ class Coordinator:
         Returns:
             ExecutionPlan
         """
-        # 1. rasa进行意图识别, 可以后续替换为大模型进行
-        rasa_url = settings.RASA_URL
-        rasa_data = {
-            "sender": "sender002", "message": user_input
-        }
-        rasa_response = requests.post(url=rasa_url, json=rasa_data, headers={"Content-Type": "application/json"})
-        logging.info(f"rasa_response: {rasa_response.text}")
+        indexList = []
+        if INTENT_TYPE == 0:
+            # 1. rasa进行意图识别, 可以后续替换为大模型进行
+            rasa_url = settings.RASA_URL
+            rasa_data = {
+                "sender": "sender002", "message": user_input
+            }
+            rasa_response = requests.post(url=rasa_url, json=rasa_data, headers={"Content-Type": "application/json"})
+            logging.info(f"rasa_response: {rasa_response.text}")
 
-        rasa_obj = rasa_response.text
-        data = json.loads(rasa_obj)
+            rasa_obj = rasa_response.text
+            data = json.loads(rasa_obj)
 
-        logging.info(f"first: {data[0]}")
-        first_text = data[0]["text"]
-        logging.info(f"first_text: {first_text}")
-        # 2. 返回skills, 暂时先只触发一个skill
-        index = int(first_text)
-        loadSkill = settings.SKILLS[index-1]
-        logging.info(f"first_text: {loadSkill}")
+            logging.info(f"first: {data[0]}")
+            first_text = data[0]["text"]
+            logging.info(f"first_text: {first_text}")
+            # 2. 返回skills, 暂时先只触发一个skill
+            indexList = [int(first_text)]
 
-        skill_dir = Path(settings.SKILLS_DIR) / loadSkill
-        skill_md = skill_dir / "SKILL.md"
+        else:
+            # 用大模型来进行意图识别
+            available_skills = self.skill_registry.get_all_skills()
+            skills_desc = self._format_skills(available_skills)
+            # system_prompt = INTENT_PROMPT.format(available_skills)
+            system_prompt = f"""
+            你是一个意图分类器。分析用户输入，识别其中包含的所有意图场景。
+场景列表：
+{skills_desc}
+规则：
+1. 返回 JSON，格式：{{"scenes":["tag-trend","device-healthy",...],"composite":true/false}}
+2. 如果用户只有单一意图：{{"scenes":["tag-trend"],"composite":false}}
+3. 如果用户有多个意图（如"审查代码并优化性能再写文档"）：{{"scenes":["review","perf","doc"],"composite":true}}
+4. scenes 数组按主次顺序排列，最重要的在前面，最多 5 个
+5. 如果都不太匹配，返回 {{"scenes":["optimize"],"composite":false}}
+6. 不要返回任何其他文字，只返回 JSON`;
+            """
+            logger.info(f"system_prompt: {system_prompt}")
+            result = generate_intents(system_prompt, user_input)
+            # 得到index
+            for index, name in enumerate(settings.SKILLS):
+                for ressult_item in result:
+                    if name == ressult_item:
+                        indexList.append(index)
+        if len(indexList) == 0:
+            logging.warning(f"no skills found")
+            return "todo：默认处理"
 
-        skill = SkillRegistry.get_instance().get_skill(loadSkill)
-        logging.info(f"skill: {skill}")
-
-        from agent.mcp.mcptools import get_mcp_tools
-
-        logger.info("Initializing MCP tools...")
-        _mcp_tools_cache = await get_mcp_tools()
 
         # 将结果拼接到字符串
         result = ""
-        # 执行mcp
-        for mcp in skill.tools:
-            logger.info(f"mcp: {mcp}")
-            mcp_tool = self.find_mcp(mcp.strip(), _mcp_tools_cache)
-            call_tool_result = None
-            if mcp.endswith("cg_device_healthy") :
-                call_tool_result = await mcp_tool.ainvoke(input={"orginal": user_input, "thread_id": session_id})
-            else:
-                # 查看mcp的参数
+        # 遍历意图对应的skill
+        for index in indexList:
+            loadSkill = settings.SKILLS[indexList[index-1]]
+            logging.info(f"loadSkill: {loadSkill}")
+            skill_dir = Path(settings.SKILLS_DIR) / loadSkill
+            skill_md = skill_dir / "SKILL.md"
+
+            skill = SkillRegistry.get_instance().get_skill(loadSkill)
+            skill.load_mcps()
+            logging.info(f"skill: {skill}")
+
+            from agent.mcp.mcptools import get_mcp_tools
+
+            logger.info("Initializing MCP tools...")
+            _mcp_tools_cache = await get_mcp_tools()
+
+
+            # 遍历skill里设置的mcp
+            for mcp in skill.tools:
                 logger.info(f"mcp: {mcp}")
-                args = mcp_tool.args
-                params = {}
-                for key in args.keys():
-                    if key == "thread_id":
-                        params[key] = session_id
-                    else:
-                        redis_key = f"{session_id}_{key}"
-                        if memoryRedis.has_key(redis_key):
-                            value = memoryRedis.get_cache(redis_key)
-                            params[key] = value
-                call_tool_result = await mcp_tool.ainvoke(input=params)
-
-            logger.info(f"result1: {call_tool_result}")
-
-            # 处理结果
-            text_result = call_tool_result[0]['text']
-            json_result = None
-            try:
-                json_result = json.loads(text_result)
-            except json.JSONDecodeError as e:
-                logger.warning(f"json_result is None:{e}")
-                json_result = None
-            if json_result is not None:
-
-                if len(json_result) == 0:
-                    logger.warn("json_result is 0")
-
-                for key, value in json_result.items():
-                    if key.startswith("cached_"):
-                        redis_key = "";
-                        if session_id is not None:
-                            redis_key = f"{session_id}_{key}"
+                mcp_tool = self.find_mcp(mcp.strip(), _mcp_tools_cache)
+                call_tool_result = None
+                if mcp.endswith("cg_device_healthy") :
+                    call_tool_result = await mcp_tool.ainvoke(input={"orginal": user_input, "thread_id": session_id})
+                else:
+                    # 查看mcp的参数
+                    logger.info(f"mcp: {mcp}")
+                    args = mcp_tool.args
+                    params = {}
+                    for key in args.keys():
+                        if key == "thread_id":
+                            params[key] = session_id
                         else:
-                            redis_key = key
-                        memoryRedis.set_cache(redis_key, value)
-                if "llmMsg" in json_result:
-                    llmMsg = json_result["llmMsg"]
-                    result += llmMsg
+                            redis_key = f"{session_id}_{key}"
+                            if memoryRedis.has_key(redis_key):
+                                value = memoryRedis.get_cache(redis_key)
+                                params[key] = value
+                    call_tool_result = await mcp_tool.ainvoke(input=params)
+
+                logger.info(f"result1: {call_tool_result}")
+
+                # 处理结果
+                text_result = call_tool_result[0]['text']
+                json_result = None
+                try:
+                    json_result = json.loads(text_result)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"json_result is None:{e}")
+                    json_result = None
+                if json_result is not None:
+
+                    if len(json_result) == 0:
+                        logger.warn("json_result is 0")
+
+                    for key, value in json_result.items():
+                        if key.startswith("cached_"):
+                            redis_key = "";
+                            if session_id is not None:
+                                redis_key = f"{session_id}_{key}"
+                            else:
+                                redis_key = key
+                            memoryRedis.set_cache(redis_key, value)
+                    if "llmMsg" in json_result:
+                        llmMsg = json_result["llmMsg"]
+                        result += llmMsg
+                    else:
+                        result += text_result
                 else:
                     result += text_result
-            else:
-                result += text_result
-            result += "\n"
+                result += "\n"
         logger.info(f"result: {result}")
         return result
-        # self.context.set_component("planner")
-        #
-        # available_skills = self.skill_registry.get_all_skills()
-        # conversation_history = self.context.read_layer1("conversation_history") or []
-        #
-        # plan = self.planner.generate_plan(user_input, available_skills, conversation_history)
-        #
-        # # Store plan in context
-        # self.context.write_layer1("execution_plan", plan.to_dict(), "planner")
-        # self.context.write_layer1("parsed_intent", plan.intent, "planner")
-        #
-        # self._metrics["successful_plans"] += 1
-        # return plan
+
+    def _format_skills(self, available_skills: Dict) -> str:
+        """Format available skills for prompt."""
+        lines = []
+        index = 1
+        for name, skill in available_skills.items():
+            lines.append(
+                f"- {name}: {skill.description}\n"
+                # f"  Triggers: {', '.join(skill.triggers)}\n"
+                # f"  Tags: {', '.join(skill.tags)}"
+            )
+        return "\n".join(lines)
 
     async def _execution_flash(self, session_id: str, user_input: str) -> str:
         from agent.modes.flash import execution_flash

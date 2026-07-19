@@ -11,7 +11,8 @@ from typing import Dict, Optional
 
 from agent.errors import SkillNotFoundError
 from agent.langchain.llm import generate_mcp_plans
-
+import logging
+logger = logging.getLogger(__name__)
 # 为0 --从代码， 为1从大模型
 LORD_MCP_TYPER = 0
 
@@ -28,6 +29,7 @@ class Skill:
     directory: Path
     input_schema: Optional[dict] = None
     output_schema: Optional[str] = None
+    tools_loaded = False
     tools: List[str] = None
     prompt: str = None
     workflow: str = None
@@ -72,6 +74,24 @@ class Skill:
             for trigger in self.triggers
         )
 
+    def load_mcps(self):
+        if self.tools_loaded:
+            return
+        logger.info(f"Loading MCPs")
+        try:
+            mcps = []
+            if LORD_MCP_TYPER == 0:
+                mcps = self.extract_mcps(self.body)
+                if not mcps and self.workflow:
+                    mcps = self.extract_mcps(self.workflow)
+            else:
+                mcps = generate_mcp_plans(self.workflow)
+            self.tools = mcps
+            self.tools_loaded = True
+        except Exception as e:
+            logger.error(f"Failed to load MCPs: {e}")
+
+
     def to_dict(self) -> dict:
         """Convert to dictionary."""
         return {
@@ -87,6 +107,19 @@ class Skill:
             "has_schema": self.has_schema,
             "tools": self.tools
         }
+
+    def extract_mcps(self, text: str) -> list:
+        """Extract MCPs from text.
+        Args:
+        """
+        pattern = re.compile(r"`([^`]+)`")
+        unique_tools = []
+        for line in text.splitlines():
+            matches = pattern.findall(line)
+            for item in matches:
+                if item not in unique_tools:
+                    unique_tools.append(item)
+        return unique_tools
 
 
 class SkillLoader:
@@ -147,18 +180,7 @@ class SkillLoader:
         return self._skills
 
 
-    def extract_mcps(self, text: str) -> list:
-        """Extract MCPs from text.
-        Args:
-        """
-        pattern = re.compile(r"`([^`]+)`")
-        unique_tools = []
-        for line in text.splitlines():
-            matches = pattern.findall(line)
-            for item in matches:
-                if item not in unique_tools:
-                    unique_tools.append(item)
-        return unique_tools
+
 
     def extract_md_section(self, md_text: str, target: str) -> str:
         """Extract section under # / ## / ### title matching target (exact or contains).
@@ -243,13 +265,13 @@ class SkillLoader:
             or self.extract_md_section(md_body, "流程")
         )
         # MCP 从全文提取（工具表 + workflow 中的 `tool`）
-        mcps = []
-        if LORD_MCP_TYPER == 0:
-            mcps = self.extract_mcps(md_body)
-            if not mcps and workflow_content:
-                mcps = self.extract_mcps(workflow_content)
-        else:
-            mcps = generate_mcp_plans(workflow_content)
+        # mcps = []
+        # if LORD_MCP_TYPER == 0:
+        #     mcps = self.extract_mcps(md_body)
+        #     if not mcps and workflow_content:
+        #         mcps = self.extract_mcps(workflow_content)
+        # else:
+        #     mcps = generate_mcp_plans(workflow_content)
 
 
         return Skill(
@@ -261,11 +283,14 @@ class SkillLoader:
             directory=skill_dir,
             input_schema=input_schema,
             output_schema=output_schema,
-            tools=mcps,
+            tools=[],
             prompt=prompt_content or "",
             workflow=workflow_content or md_body,
             body=md_body or document or "",
         )
+
+    def load_tools(self):
+        logging.info("Loading tools")
 
     def _load_skill_from_md(self, skill_dir: Path, skill_md: Path) -> Skill:
         """Load skill metadata from SKILL.md file.

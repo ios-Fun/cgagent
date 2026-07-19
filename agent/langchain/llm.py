@@ -56,7 +56,7 @@ def _build_chat_model(cfg: dict) -> Any:
         kwargs["base_url"] = cfg["base_url"]
     return ChatOpenAI(**kwargs)
 
-
+# 得到推理结果
 def generate_context(
     context: str,
     memory_context: Optional[str] = None,
@@ -113,6 +113,28 @@ def generate_mcp_plans(workflow_content:str) -> list:
             tool_name = item["tool"]
             tool_list2.append(tool_name)
         return tool_list2
+    except Exception as e:
+        print(f"调用 LLM 失败：{e}")
+        return "调用 LLM 失败"
+
+# 用大模型做意图识别
+def generate_intents(system_prompt:str, user_content: str) -> list:
+    cfg = _synthesis_settings()
+    llm = _build_chat_model(cfg)
+    # 从大模型得到执行计划
+    # prompt_content = PLAN_PROMPT.format(workflow_content)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_content),
+    ]
+    try:
+        parser = JsonOutputParser()
+
+        response = llm.invoke(messages)
+        logger.info("llm generate_intents: %s", response.content)
+        data = parser.parse(response.content)
+        list = data["scenes"]
+        return list
     except Exception as e:
         print(f"调用 LLM 失败：{e}")
         return "调用 LLM 失败"
