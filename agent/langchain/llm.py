@@ -5,7 +5,17 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agent.yaml_settings import get_section
 from langchain_core.output_parsers import JsonOutputParser
 import logging
+from langfuse import Langfuse
+
 from agent.langchain.prompt import PLAN_PROMPT
+from langfuse.langchain import CallbackHandler
+
+
+langfuse = Langfuse(
+    public_key="pk-lf-ff61ea39-d357-4614-a204-04346e964542",
+    secret_key="sk-lf-896d4499-98d4-4e72-8502-eefc0cc2875c",
+    host="http://localhost:3010"
+)
 logger = logging.getLogger(__name__)
 def _synthesis_settings() -> dict:
     synth = get_section("synthesis_llm")
@@ -86,7 +96,8 @@ def generate_context(
         HumanMessage(content=human),
     ]
     try:
-        response = llm.invoke(messages)
+        langfuse_handler = CallbackHandler()
+        response = llm.invoke(messages,config={"callbacks": [langfuse_handler]})
         return response.content
     except Exception as e:
         print(f"调用 LLM 失败：{e}")
@@ -104,8 +115,8 @@ def generate_mcp_plans(workflow_content:str) -> list:
     ]
     try:
         parser = JsonOutputParser()
-
-        response = llm.invoke(messages)
+        langfuse_handler = CallbackHandler()
+        response = llm.invoke(messages, config={"callbacks": [langfuse_handler]})
         logger.info("llm generate_mcp_plans: %s", response.content)
         data = parser.parse(response.content)
         tool_list2 = []
@@ -129,8 +140,8 @@ def generate_intents(system_prompt:str, user_content: str) -> list:
     ]
     try:
         parser = JsonOutputParser()
-
-        response = llm.invoke(messages)
+        langfuse_handler = CallbackHandler()
+        response = llm.invoke(messages, config={"callbacks": [langfuse_handler]})
         logger.info("llm generate_intents: %s", response.content)
         data = parser.parse(response.content)
         list = data["scenes"]

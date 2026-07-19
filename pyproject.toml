@@ -22,8 +22,9 @@ dependencies = [
     "psycopg-binary",
     "psycopg-pool>=3.3.0",
     "langchain-openai>=0.3.0",
+    "langfuse",
+    "langchain",
 ]
-
 
 [tool.uv]
 index-url = "https://pypi.org/simple"
