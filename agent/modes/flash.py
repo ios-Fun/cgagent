@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Set
 
 from agent.mcp.mcptools import get_mcp_tools
@@ -15,6 +16,7 @@ from agent.modes.common import (
     resolve_tool,
     tool_needs_params,
 )
+from utils.skill_loader import Skill
 
 logger = logging.getLogger(__name__)
 
@@ -597,7 +599,10 @@ def _skill_allowed_tools(skill: Any, mcp_tools_cache: list) -> List[str]:
 
     cache = list(mcp_tools_cache or [])
     cache_names = [getattr(t, "name", str(t)) for t in cache if getattr(t, "name", None)]
-    declared = list(getattr(skill, "tools", None) or [])
+    mcps = skill.extract_mcps(skill.body)
+    if not mcps and skill.workflow:
+        mcps = skill.extract_mcps(skill.workflow)
+    declared = list(mcps or [])
 
     # No SKILL whitelist -> all loaded MCP tools
     if not declared:
@@ -809,7 +814,10 @@ def plan_skill_execution(
     policy_snip = (policy or "")[:8000]
     tools_snip = (tools_text or "")[:6000]
     allow_list = ", ".join(allowed_tools) if allowed_tools else "(all loaded)"
-
+    from datetime import datetime
+    now = datetime.now().astimezone()
+    now_iso = now.isoformat(timespec="seconds")
+    now_human = now.strftime("%Y-%m-%d %H:%M:%S %z")
     prompt = f"""你是技能执行规划器（Skill Execution Planner）。
 你的职责：
 根据 Skill 权威规则、用户问题和已有上下文，为当前 Skill 生成执行计划。
@@ -825,6 +833,10 @@ session_id:
 ---
 # 用户问题
 {user_input}
+
+当前时间（计算相对时间唯一依据）：
+ISO: {now_iso}
+本地: {now_human}
 ---
 # 会话历史（多轮追问上下文，可空）
 {history if history else "(空)"}
@@ -1065,15 +1077,17 @@ async def run_skill_policy2(
         session_history=session_history,
     )
     steps = plan.get("steps") or []
+    synthesis_constraints = _extract_synthesis_constraints_regex(policy)
     if not steps:
         logger.warning("flash skill=%s empty plan; fallback tool order", skill_name)
         steps = _fallback_steps_from_skill(skill, allowed_tools)
     logger.info(
-        "flash skill=%s plan intent=%s steps=%s reason=%s",
+        "flash skill=%s plan intent=%s steps=%s reason=%s constraints_chars=%d",
         skill_name,
         (plan.get("intent") or "")[:80],
         [(s.get("action"), s.get("mcp")) for s in steps],
         (plan.get("reason") or "")[:120],
+        len(synthesis_constraints),
     )
 
     notes: List[str] = []
@@ -1180,7 +1194,51 @@ async def run_skill_policy2(
         executed=sorted(executed),
         last_action=last_action,
         draft_final=final_user_text,
+        synthesis_constraints=synthesis_constraints,
     )
+
+
+# Skill 成文约束标题：匹配到则截取到下一同级/上级标题或文末；匹配不到返回空
+_CONSTRAINT_HEADING_RE = re.compile(
+    r"(?m)^[ \t]{0,3}#{1,3}[ \t]+("
+    r"注意事项|注意|输出要求|输出格式|最终报告|报告要求|"
+    r"写作要求|成文要求|禁止事项|约束|规范"
+    r")[ \t]*$"
+)
+_NEXT_HEADING_RE = re.compile(r"(?m)^[ \t]{0,3}#{1,3}[ \t]+\S")
+
+
+def _extract_synthesis_constraints_regex(policy: str, *, max_chars: int = 1200) -> str:
+    """从 Skill 正文用正则截取「注意事项/输出要求」等段落；无匹配则空串。"""
+    text = (policy or "").strip()
+    if not text:
+        return ""
+    matches = list(_CONSTRAINT_HEADING_RE.finditer(text))
+    if not matches:
+        return ""
+    chunks: List[str] = []
+    seen_spans: List[tuple] = []
+    for m in matches:
+        start = m.start()
+        # 跳过与已截取重叠的标题
+        if any(s <= start < e for s, e in seen_spans):
+            continue
+        rest = text[m.end() :]
+        nxt = _NEXT_HEADING_RE.search(rest)
+        end = m.end() + nxt.start() if nxt else len(text)
+        piece = text[start:end].strip()
+        if not piece:
+            continue
+        seen_spans.append((start, end))
+        chunks.append(piece)
+        if len(chunks) >= 3:
+            break
+    if not chunks:
+        return ""
+    joined = "\n\n".join(chunks).strip()
+    if len(joined) > max_chars:
+        joined = joined[:max_chars] + "\n...(constraints truncated)"
+    return joined
 
 
 def _build_skill_evidence_package(
@@ -1191,9 +1249,10 @@ def _build_skill_evidence_package(
     executed: List[str],
     last_action: str = "",
     draft_final: str = "",
+    synthesis_constraints: str = "",
 ) -> str:
     """Package skill run as reference content for the synthesis layer."""
-    # 排除会话历史 / prior：只给合成层本轮 tool 与分析证据
+    # 排除会话历史 / prior：只给合成层本轮 tool 与分析证据 + 成文约束
     evidence = build_policy_context(
         [
             n
@@ -1206,6 +1265,9 @@ def _build_skill_evidence_package(
     draft = (draft_final or "").strip()
     if len(draft) > 2000:
         draft = draft[:2000] + "\n...(draft truncated)"
+    constraints = (synthesis_constraints or "").strip()
+    if len(constraints) > 1200:
+        constraints = constraints[:1200] + "\n...(constraints truncated)"
 
     parts = [
         f"## Skill 执行证据: {skill_name}",
@@ -1213,6 +1275,11 @@ def _build_skill_evidence_package(
         f"结束动作: {last_action or 'unknown'}",
         f"已调用工具: {executed or []}",
     ]
+    if constraints:
+        parts.append(
+            "\n### 成文约束（来自 Skill，最终回答必须遵守）\n"
+            f"{constraints}"
+        )
     if evidence:
         parts.append(f"\n### 工具结果与中间分析\n{evidence}")
     else:
@@ -1577,7 +1644,10 @@ def route_skills(
     history_snip = (session_history or "").strip()
     if len(history_snip) > 3000:
         history_snip = history_snip[:3000] + "\n...(history truncated)"
-
+    from datetime import datetime
+    now = datetime.now().astimezone()
+    now_iso = now.isoformat(timespec="seconds")
+    now_human = now.strftime("%Y-%m-%d %H:%M:%S %z")
     prompt = f"""你是问答路径路由器；根据用户问题的业务意图选择最合适的处理路径。
 
 路径选择原则：
@@ -1594,6 +1664,10 @@ def route_skills(
 
 用户问题：
 {user_input}
+
+当前时间（计算相对时间唯一依据）：
+ISO: {now_iso}
+本地: {now_human}
 
 会话历史（可空）：
 {history_snip if history_snip else "(空)"}
