@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from agent.mcp.mcptools import get_mcp_tools
 from agent.modes.common import (
@@ -28,6 +28,11 @@ MAX_ADHOC_MCP_CALLS = 3
 RESULT_SNIPPET_LIMIT = 50000
 # Per tool-result note budget (avoid one 11k dump wiping older steps)
 MAX_TOOL_NOTE_CHARS = 10000
+# v3: plan + conditional react budgets
+MAX_SKILL_V3_TURNS = 15
+MAX_SKILL_V3_LLM = 10
+MAX_SKILL_V3_MCP = 20
+MAX_SKILL_V3_OBS = 20
 
 
 async def execution_flash(coordinator: Any, session_id: str, user_input: str) -> str:
@@ -132,7 +137,7 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
             continue
 
         logger.info("flash execute skill-policy2=%s", skill_name)
-        skill_output = await run_skill_policy2(
+        skill_output = await run_skill_policy3(
             coordinator,
             skill=skill,
             user_input=user_input,
@@ -1196,6 +1201,450 @@ async def run_skill_policy2(
         draft_final=final_user_text,
         synthesis_constraints=synthesis_constraints,
     )
+
+
+
+async def run_skill_policy3(
+    coordinator: Any,
+    *,
+    skill: Any,
+    user_input: str,
+    session_id: str,
+    mcp_tools_cache: list,
+    mcp_catalog: str,
+    prior_results: str = "",
+    session_history: str = "",
+) -> str:
+    """Plan cold-start + conditional ReAct + hard guards.
+
+    Drop-in signature for run_skill_policy2. Happy path follows hint plan without
+    per-step decide; failures / empty tools / missing next trigger a short decide.
+    Output remains an evidence package for generate_context.
+    """
+    from agent.memory.message_store import message_store
+
+    skill_name = getattr(skill, "name", "skill")
+    policy = _skill_policy_text(skill)
+    allowed_tools = _skill_allowed_tools(skill, mcp_tools_cache)
+    allowed_set = set(allowed_tools)
+    if not session_history:
+        session_history = message_store.format_for_prompt(session_id)
+
+    allowed_catalog_lines = []
+    for tool in mcp_tools_cache or []:
+        name = getattr(tool, "name", str(tool))
+        if name in allowed_set or any(
+            name.endswith(a) or a.endswith(name) for a in allowed_tools
+        ):
+            desc = (getattr(tool, "description", None) or "")[:160]
+            args = format_tool_args_for_prompt(tool)
+            allowed_catalog_lines.append(f"- {name}: {desc}\n  args: {args}")
+    tools_text = "\n".join(allowed_catalog_lines) if allowed_catalog_lines else (
+        "allowed tool names: " + ", ".join(allowed_tools)
+    )
+
+    plan = plan_skill_execution(
+        coordinator,
+        skill_name=skill_name,
+        policy=policy,
+        user_input=user_input,
+        session_id=session_id,
+        tools_text=tools_text,
+        allowed_tools=allowed_tools,
+        prior_results=prior_results,
+        session_history=session_history,
+    )
+    llm_calls = 1  # cold_start plan
+    steps = list(plan.get("steps") or [])
+    synthesis_constraints = _extract_synthesis_constraints_regex(policy)
+    if not steps:
+        logger.warning("flash v3 skill=%s empty plan; fallback tool order", skill_name)
+        steps = _fallback_steps_from_skill(skill, allowed_tools)
+
+    logger.info(
+        "flash v3 skill=%s plan intent=%s steps=%s reason=%s",
+        skill_name,
+        (plan.get("intent") or "")[:80],
+        [(s.get("action"), s.get("mcp")) for s in steps],
+        (plan.get("reason") or "")[:120],
+    )
+
+    notes: List[str] = []
+    if session_history:
+        notes.append(f"[session_history]\n{session_history[:4000]}")
+    if prior_results:
+        notes.append(f"[prior]\n{prior_results[:3000]}")
+    notes.append(
+        f"[plan]\nintent={plan.get('intent') or ''}\n"
+        f"reason={plan.get('reason') or ''}\n"
+        f"steps={[(s.get('action'), s.get('mcp'), s.get('purpose')) for s in steps]}"
+    )
+
+    executed: Dict[str, str] = {}  # tool -> last status
+    observations: List[Dict[str, Any]] = []
+    hint_idx = 0
+    last_action = ""
+    final_user_text = ""
+    mcp_calls = 0
+    consecutive_fail = 0
+    force_done = False
+
+    def _tool_allowed(mcp_name: str) -> bool:
+        if not allowed_tools:
+            return True
+        return any(
+            mcp_name == a or mcp_name.endswith(a) or a.endswith(mcp_name)
+            for a in allowed_tools
+        )
+
+    def _obs_summary(limit: int = 3500) -> str:
+        if not observations:
+            return "(无)"
+        lines = []
+        used = 0
+        for o in observations[-MAX_SKILL_V3_OBS:]:
+            snip = (o.get("snippet") or "")[:500]
+            line = (
+                f"- {o.get('kind')}:{o.get('name') or ''} "
+                f"status={o.get('status') or ''} "
+                f"purpose={o.get('purpose') or ''}\n  {snip}"
+            )
+            if used + len(line) > limit:
+                break
+            lines.append(line)
+            used += len(line)
+        return "\n".join(lines) if lines else "(无)"
+
+    def _push_obs(
+        kind: str,
+        name: str,
+        status: str,
+        purpose: str,
+        snippet: str,
+    ) -> None:
+        observations.append(
+            {
+                "kind": kind,
+                "name": name,
+                "status": status,
+                "purpose": purpose or "",
+                "snippet": (snippet or "")[:800],
+            }
+        )
+        if len(observations) > MAX_SKILL_V3_OBS * 2:
+            del observations[: len(observations) - MAX_SKILL_V3_OBS]
+
+    def _guard_action(action: Dict[str, Any], turn: int) -> Dict[str, Any]:
+        nonlocal force_done
+        act = (action.get("action") or "").lower().strip()
+        if act in ("final_answer", "done"):
+            act = "done"
+        if (
+            turn >= MAX_SKILL_V3_TURNS
+            or llm_calls >= MAX_SKILL_V3_LLM
+            or mcp_calls >= MAX_SKILL_V3_MCP
+            or force_done
+        ):
+            if any(s == "ok" for s in executed.values()):
+                if act != "done" and turn < MAX_SKILL_V3_TURNS and llm_calls < MAX_SKILL_V3_LLM:
+                    return {
+                        "action": "analyze",
+                        "reason": "budget_force_close",
+                        "purpose": "利用已有结果收束",
+                    }
+                return {"action": "done", "reason": "budget_force_done"}
+            return {
+                "action": "stop",
+                "reason": "budget_or_no_data",
+                "user_message": "未能在预算内取得有效业务数据，请补充机组/设备名称或稍后重试。",
+            }
+
+        if act == "call_mcp":
+            mcp_name = (action.get("mcp") or action.get("tool") or "").strip()
+            if not mcp_name:
+                return {
+                    "action": "stop",
+                    "reason": "call_mcp_missing_name",
+                    "user_message": "执行计划缺少工具名。",
+                }
+            if not _tool_allowed(mcp_name):
+                return {
+                    "action": "analyze" if executed else "stop",
+                    "reason": f"blocked_tool:{mcp_name}",
+                    "purpose": "工具不在 skill 白名单",
+                    "user_message": f"工具不在技能允许列表: {mcp_name}",
+                }
+            prev = executed.get(mcp_name)
+            if prev == "ok":
+                if any(s == "ok" for s in executed.values()):
+                    return {
+                        "action": "analyze",
+                        "reason": f"skip_repeat_ok:{mcp_name}",
+                        "purpose": "工具已成功，改为分析",
+                    }
+                return {"action": "done", "reason": f"skip_repeat_ok:{mcp_name}"}
+            if prev in ("empty", "error") and consecutive_fail >= 2:
+                return {
+                    "action": "stop",
+                    "reason": "repeated_tool_fail",
+                    "user_message": "多次取数失败或为空，请核对对象名称/时间范围后重试。",
+                }
+            if mcp_calls >= MAX_SKILL_V3_MCP:
+                return {
+                    "action": "done" if executed else "stop",
+                    "reason": "mcp_budget",
+                }
+
+        if act == "analyze" and not executed:
+            return {
+                "action": "stop",
+                "reason": "analyze_without_data",
+                "user_message": "尚无工具数据，无法分析。",
+            }
+
+        out = dict(action)
+        out["action"] = act
+        return out
+
+    def _next_hint() -> Optional[Dict[str, Any]]:
+        nonlocal hint_idx
+        while hint_idx < len(steps):
+            step = steps[hint_idx]
+            hint_idx += 1
+            act = (step.get("action") or "").lower().strip()
+            if act in ("final_answer", "done"):
+                act = "stop"
+            out: Dict[str, Any] = {
+                "action": act,
+                "purpose": step.get("purpose") or step.get("reason") or "",
+                "reason": step.get("reason") or "hint_plan",
+                "source": "hint",
+            }
+            if act == "call_mcp":
+                out["mcp"] = step.get("mcp") or step.get("tool") or ""
+            if act == "stop":
+                out["user_message"] = step.get("reason") or step.get("purpose") or ""
+            return out
+        return None
+
+    def _decide_next() -> Dict[str, Any]:
+        nonlocal llm_calls
+        if llm_calls >= MAX_SKILL_V3_LLM:
+            return {
+                "action": "done" if any(s == "ok" for s in executed.values()) else "stop",
+                "reason": "llm_budget",
+                "user_message": "推理预算用尽。",
+                "source": "decide",
+            }
+        allow_list = ", ".join(allowed_tools) if allowed_tools else "(all)"
+        remaining_tools = (
+            [a for a in allowed_tools if executed.get(a) != "ok"]
+            if allowed_tools
+            else []
+        )
+        policy_snip = (policy or "")[:4000]
+        obs = _obs_summary()
+        prompt = f"""你是技能条件决策器（仅在计划受阻时调用）。根据 Skill 规则与观察，只决定下一步一个动作。
+Skill: {skill_name}
+用户问题: {user_input}
+已执行工具状态: {executed or {}}
+连续失败次数: {consecutive_fail}
+剩余可试工具: {remaining_tools or allow_list}
+
+# Skill 规则摘录
+{policy_snip}
+
+# 结构化观察
+{obs}
+
+可选 action:
+- call_mcp: 需 mcp(必须在允许列表)、purpose
+- analyze: 基于已有 ok 数据做短分析
+- done: 流程可结束（不要写完整报告）
+- stop: 需用户补充或无法继续，填 user_message
+
+规则:
+1. 禁止重复调用 status=ok 的工具
+2. empty/error 后若无新参数线索，优先 stop 或换允许的其它工具
+3. 有 ok 数据时优先 analyze 或 done
+4. 只输出合法 JSON，不要 markdown
+
+格式:
+{{"action":"call_mcp|analyze|done|stop","reason":"","mcp":"","purpose":"","user_message":""}}
+"""
+        llm_calls += 1
+        try:
+            raw = coordinator.llm_client.invoke(prompt, temperature=0.15, max_tokens=800)
+            data = parse_json(raw)
+            if isinstance(data, dict) and data.get("action"):
+                data["source"] = "decide"
+                return data
+        except Exception as e:
+            logger.warning("flash v3 decide failed: %s", e)
+        if any(s == "ok" for s in executed.values()):
+            return {
+                "action": "analyze",
+                "reason": "decide_fail_fallback",
+                "source": "decide",
+            }
+        return {
+            "action": "stop",
+            "reason": "decide_failed",
+            "user_message": "暂时无法按技能规范完成分析，请补充更具体的机组/设备名称。",
+            "source": "decide",
+        }
+
+    for turn in range(1, MAX_SKILL_V3_TURNS + 1):
+        use_decide = False
+        if observations:
+            last = observations[-1]
+            if last.get("status") in ("empty", "error") or last.get("kind") == "guard":
+                use_decide = True
+
+        if hint_idx >= len(steps) and not force_done:
+            if any(s == "ok" for s in executed.values()):
+                action = {
+                    "action": "analyze" if last_action != "analyze" else "done",
+                    "reason": "hint_exhausted",
+                    "source": "hint",
+                }
+            else:
+                use_decide = True
+                action = _decide_next()
+        elif use_decide:
+            action = _decide_next()
+        else:
+            action = _next_hint()
+            if action is None:
+                if any(s == "ok" for s in executed.values()):
+                    action = {
+                        "action": "done",
+                        "reason": "no_more_hint",
+                        "source": "hint",
+                    }
+                else:
+                    action = _decide_next()
+
+        action = _guard_action(action, turn)
+        act = (action.get("action") or "").lower().strip()
+        last_action = act
+        purpose = action.get("purpose") or action.get("reason") or ""
+        logger.info(
+            "flash v3 skill=%s turn=%d action=%s source=%s mcp=%s reason=%s",
+            skill_name,
+            turn,
+            act,
+            action.get("source") or "",
+            action.get("mcp") or "",
+            (action.get("reason") or "")[:100],
+        )
+
+        if act in ("stop", "done", "final_answer"):
+            final_user_text = (
+                action.get("user_message")
+                or action.get("reason")
+                or purpose
+                or ""
+            ).strip()
+            if final_user_text:
+                notes.append(f"[final]\n{final_user_text}")
+            break
+
+        if act == "analyze":
+            context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
+            if llm_calls >= MAX_SKILL_V3_LLM:
+                notes.append("[analysis]\n(llm budget, skip analyze)")
+                force_done = True
+                continue
+            llm_calls += 1
+            analysis = _analyze_under_plan(
+                coordinator,
+                skill_name=skill_name,
+                policy=policy,
+                user_input=user_input,
+                purpose=purpose,
+                context=context,
+            )
+            if analysis:
+                notes.append(f"[analysis]\n{analysis}")
+                _push_obs("analyze", "analyze", "ok", purpose, analysis)
+            else:
+                _push_obs("analyze", "analyze", "empty", purpose, "")
+            if hint_idx >= len(steps):
+                force_done = True
+            continue
+
+        if act == "call_mcp":
+            mcp_name = (action.get("mcp") or action.get("tool") or "").strip()
+            if not mcp_name:
+                notes.append("[policy] call_mcp missing tool name, skip")
+                _push_obs("guard", "", "error", purpose, "missing tool name")
+                continue
+            if not _tool_allowed(mcp_name):
+                logger.warning("flash v3 skill=%s blocked mcp=%s", skill_name, mcp_name)
+                notes.append(f"[policy] tool not allowed by skill: {mcp_name}")
+                _push_obs("guard", mcp_name, "error", purpose, "not allowed")
+                continue
+
+            context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
+            params = resolve_params_for_mcp(
+                coordinator,
+                mcp_name=mcp_name,
+                mcp_tools_cache=mcp_tools_cache,
+                user_input=user_input,
+                session_id=session_id,
+                purpose=purpose,
+                accumulated_results=context,
+            )
+            if isinstance(action.get("params"), dict) and action["params"]:
+                for k, v in action["params"].items():
+                    if k not in params or params[k] is None:
+                        params[k] = v
+
+            step_text = await invoke_mcp(
+                coordinator,
+                session_id=session_id,
+                user_input=user_input,
+                mcp_name=mcp_name,
+                mcp_tools_cache=mcp_tools_cache,
+                params_hint=params,
+            )
+            mcp_calls += 1
+            status = _classify_tool_result_status(step_text or "")
+            executed[str(mcp_name)] = status
+            notes.append(_format_tool_note(str(mcp_name), step_text))
+            _push_obs("tool", str(mcp_name), status, purpose, step_text or "")
+            message_store.append_tool(
+                session_id,
+                step_text or f"(empty/error status={status})",
+                name=str(mcp_name),
+                meta={
+                    "skill": skill_name,
+                    "purpose": purpose,
+                    "status": status,
+                    "path": "skill_v3",
+                },
+            )
+            if status == "ok":
+                consecutive_fail = 0
+            else:
+                consecutive_fail += 1
+            continue
+
+        notes.append(f"[policy] unknown v3 action: {act}")
+        _push_obs("guard", act, "error", purpose, f"unknown action {act}")
+        break
+
+    return _build_skill_evidence_package(
+        skill_name=skill_name,
+        user_input=user_input,
+        notes=notes,
+        executed=sorted(executed.keys()),
+        last_action=last_action,
+        draft_final=final_user_text,
+        synthesis_constraints=synthesis_constraints,
+    )
+
 
 
 # Skill 成文约束标题：匹配到则截取到下一同级/上级标题或文末；匹配不到返回空
