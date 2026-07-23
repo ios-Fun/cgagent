@@ -20,25 +20,388 @@ from utils.skill_loader import Skill
 
 logger = logging.getLogger(__name__)
 
-# Max agent turns per skill (call_mcp / analyze / done)
-MAX_SKILL_TURNS = 12
-# Max MCP calls when no skill matched (ad-hoc tool path)
+#  v2 Max agent turns per skill (call_mcp / analyze / done)
+MAX_SKILL_TURNS = 15
 MAX_ADHOC_MCP_CALLS = 3
-# Total context budget for policy LLM (chars)
 RESULT_SNIPPET_LIMIT = 50000
-# Per tool-result note budget (avoid one 11k dump wiping older steps)
-MAX_TOOL_NOTE_CHARS = 10000
+MAX_TOOL_NOTE_CHARS = 20000
+
 # v3: plan + conditional react budgets
-MAX_SKILL_V3_TURNS = 15
-MAX_SKILL_V3_LLM = 10
+MAX_SKILL_V3_TURNS = 20
+MAX_SKILL_V3_LLM = 20
 MAX_SKILL_V3_MCP = 20
 MAX_SKILL_V3_OBS = 20
+# 单 skill 内 analyze 次数上限（含 plan 中间分析 + 收束）
+MAX_SKILL_V3_ANALYZE = 2
+
+# v4: pure classic ReAct
+MAX_SKILL_V4_TURNS = 12
+MAX_SKILL_V4_LLM = 12
+MAX_SKILL_V4_MCP = 8
+MAX_SKILL_V4_ANALYZE = 2
+# Reflection budgets (when reflection=True)
+MAX_REFLECT_LLM_PER_SKILL = 2
+MAX_REFLECT_RETRY_SAME = 1
+MAX_REFLECT_POST_TOOL = 3
+# Manual switch: set True to enable Reflection in flash (no API wiring)
+FLASH_REFLECTION_ENABLED = True
+
+# skill 执行器select
+FLASH_SKILL_POLICY = 2
+# v1: 每轮 LLM 决策（类 ReAct）
+# v2: Plan-and-Execute
+# v3: Plan 冷启动 + 条件 ReAct
+# v4: 经典 ReAct
+
+def _reflect_parse_action(raw: Any) -> Dict[str, Any]:
+    data = parse_json(raw) if isinstance(raw, str) else raw
+    if not isinstance(data, dict):
+        return {}
+    act = str(data.get("action") or "").lower().strip()
+    if act in ("final_answer", "done"):
+        act = "done"
+    if act in ("continue", "continue_hint", "next"):
+        act = "continue_hint"
+    if act in ("retry", "retry_same"):
+        act = "retry_same"
+    if act in ("switch", "switch_tool"):
+        act = "switch_tool"
+    if act in ("need_user", "ask_user"):
+        act = "need_user"
+    data["action"] = act
+    return data
 
 
-async def execution_flash(coordinator: Any, session_id: str, user_input: str) -> str:
+def reflect_after_tool(
+    coordinator: Any,
+    *,
+    skill_name: str,
+    user_input: str,
+    tool_name: str,
+    status: str,
+    purpose: str,
+    snippet: str,
+    executed: Dict[str, str],
+    allowed_tools: List[str],
+    remaining_hint: str = "",
+    retry_same_count: int = 0,
+) -> Dict[str, Any]:
+    """Reflect-1: after MCP observe — enough? switch tool? stop?
+
+    Rule-first; LLM only when empty/error and multiple options.
+    """
+    status = (status or "").lower().strip()
+    remaining = [
+        a for a in (allowed_tools or [])
+        if executed.get(a) != "ok" and a != tool_name
+    ]
+    # rules
+    if status == "ok":
+        return {
+            "enough": True,
+            "action": "continue_hint",
+            "reason": "tool_ok_continue",
+            "source": "rule",
+        }
+    if status in ("empty", "error"):
+        if retry_same_count < MAX_REFLECT_RETRY_SAME and status == "error":
+            return {
+                "enough": False,
+                "action": "retry_same",
+                "mcp": tool_name,
+                "reason": "error_retry_once",
+                "source": "rule",
+            }
+        if remaining:
+            # optional LLM if >1 candidates
+            if len(remaining) == 1:
+                return {
+                    "enough": False,
+                    "action": "switch_tool",
+                    "mcp": remaining[0],
+                    "reason": "empty_switch_only_candidate",
+                    "source": "rule",
+                }
+            try:
+                snip = (snippet or "")[:600]
+                prompt = f"""你是工具观察反思器。刚调用的工具结果不够用，请决定下一步（只输出 JSON）。
+Skill: {skill_name}
+用户问题: {user_input}
+刚调用: {tool_name} status={status} purpose={purpose}
+结果摘录: {snip}
+已执行: {executed}
+可换工具: {remaining}
+hint剩余: {remaining_hint or "(无)"}
+
+action 只能是:
+- retry_same: 同工具再试（需认为参数可修正）
+- switch_tool: 换工具，填 mcp
+- analyze: 用已有 ok 数据收束
+- need_user: 缺用户信息
+- stop: 无法继续
+- continue_hint: 按原计划下一步
+
+格式: {{"enough":false,"action":"...","mcp":"","reason":"","user_message":""}}
+"""
+                raw = coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=400)
+                data = _reflect_parse_action(raw)
+                if data.get("action"):
+                    data["source"] = "llm"
+                    if data["action"] == "switch_tool":
+                        mcp = (data.get("mcp") or "").strip()
+                        if mcp not in remaining:
+                            data["mcp"] = remaining[0]
+                    return data
+            except Exception as e:
+                logger.warning("reflect_after_tool llm failed: %s", e)
+            return {
+                "enough": False,
+                "action": "switch_tool",
+                "mcp": remaining[0],
+                "reason": "empty_switch_fallback",
+                "source": "rule",
+            }
+        if any(s == "ok" for s in executed.values()):
+            return {
+                "enough": False,
+                "action": "analyze",
+                "reason": "no_more_tools_has_ok",
+                "source": "rule",
+            }
+        return {
+            "enough": False,
+            "action": "need_user",
+            "reason": "no_data_need_user",
+            "user_message": "未能取到有效业务数据，请补充更具体的机组/设备名称或时间范围。",
+            "source": "rule",
+        }
+    return {
+        "enough": False,
+        "action": "continue_hint",
+        "reason": "unknown_status",
+        "source": "rule",
+    }
+
+
+def reflect_evidence_sufficiency(
+    coordinator: Any,
+    *,
+    skill_name: str,
+    user_input: str,
+    evidence: str,
+    executed: List[str],
+    last_action: str = "",
+) -> Dict[str, Any]:
+    """Reflect-2: before packaging — does evidence support the user question?"""
+    ev = (evidence or "").strip()
+    if not ev or ev == "(无)":
+        return {
+            "supported": False,
+            "coverage": "none",
+            "gaps": ["无工具/分析证据"],
+            "next": "need_user",
+            "reason": "empty_evidence",
+            "source": "rule",
+        }
+    has_ok = "status=ok" in ev
+    has_tool = "[tool:" in ev
+    if not has_tool:
+        return {
+            "supported": False,
+            "coverage": "none",
+            "gaps": ["未调用工具"],
+            "next": "need_user",
+            "reason": "no_tool",
+            "source": "rule",
+        }
+    if not has_ok:
+        return {
+            "supported": False,
+            "coverage": "none",
+            "gaps": ["工具无有效业务数据"],
+            "next": "need_user",
+            "reason": "no_ok_tool",
+            "source": "rule",
+        }
+    # light LLM for partial vs full
+    try:
+        prompt = f"""你是证据充分性评估器。判断当前证据能否支撑回答用户问题。只输出 JSON。
+Skill: {skill_name}
+用户问题: {user_input}
+已调用工具: {executed}
+结束动作: {last_action}
+证据摘录:
+{(ev or "")[:8000]}
+
+字段:
+- supported: true/false（能否给出有依据的回答，允许部分回答为 true）
+- coverage: full|partial|none
+- gaps: 字符串数组，缺什么（可空）
+- next: partial_answer|need_user|stop（不要 retry，收束阶段）
+- reason: 一句话
+
+格式: {{"supported":true,"coverage":"partial","gaps":[],"next":"partial_answer","reason":""}}
+"""
+        raw = coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=500)
+        data = parse_json(raw)
+        if isinstance(data, dict) and data.get("coverage"):
+            data["source"] = "llm"
+            nxt = str(data.get("next") or "partial_answer").lower()
+            if nxt not in ("partial_answer", "need_user", "stop"):
+                data["next"] = "partial_answer" if data.get("supported") else "need_user"
+            return data
+    except Exception as e:
+        logger.warning("reflect_evidence_sufficiency failed: %s", e)
+    return {
+        "supported": True,
+        "coverage": "partial",
+        "gaps": [],
+        "next": "partial_answer",
+        "reason": "rule_has_ok_default_partial",
+        "source": "rule",
+    }
+
+
+def reflect_multi_skill(
+    coordinator: Any,
+    *,
+    user_input: str,
+    result_parts: List[str],
+    skill_names: List[str],
+    intent: str = "",
+) -> Dict[str, Any]:
+    """Reflect-3: after all skills — merge/conflict/adhoc decision."""
+    parts = [p for p in result_parts if p and str(p).strip()]
+    if not parts:
+        return {
+            "action": "adhoc",
+            "reason": "all_skills_empty",
+            "conflict": False,
+            "source": "rule",
+        }
+    ok_parts = [p for p in parts if "status=ok" in p]
+    if not ok_parts:
+        return {
+            "action": "adhoc",
+            "reason": "no_ok_in_skills",
+            "conflict": False,
+            "source": "rule",
+        }
+    if len(parts) == 1:
+        return {
+            "action": "merge",
+            "reason": "single_skill",
+            "conflict": False,
+            "ordered_indices": [0],
+            "source": "rule",
+        }
+    # multi: light LLM or merge
+    try:
+        previews = []
+        for i, part in enumerate(parts):
+            previews.append(f"--- part{i} skill_hint={skill_names[i] if i < len(skill_names) else i} ---\n{(part or '')[:2500]}")
+        body = "\n\n".join(previews)
+        prompt = f"""你是多 Skill 结果协调器。判断多个 skill 证据如何合并。只输出 JSON。
+用户问题: {user_input}
+意图: {intent or "(无)"}
+各 skill 证据预览:
+{body}
+
+action:
+- merge: 互补或重复，合并使用（默认）
+- conflict: 结论冲突，需并列保留并标注
+- drop_weak: 丢弃明显答非所问的 part，保留 ordered_indices
+- adhoc: 仅当现有证据完全无用时（极少）
+
+格式: {{"action":"merge|conflict|drop_weak|adhoc","reason":"","conflict":false,"ordered_indices":[0,1],"notes":"给合成层的一句话"}}
+"""
+        raw = coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=500)
+        data = parse_json(raw)
+        if isinstance(data, dict) and data.get("action"):
+            data["source"] = "llm"
+            act = str(data.get("action")).lower()
+            if act not in ("merge", "conflict", "drop_weak", "adhoc"):
+                data["action"] = "merge"
+            idxs = data.get("ordered_indices")
+            if not isinstance(idxs, list) or not idxs:
+                data["ordered_indices"] = list(range(len(parts)))
+            return data
+    except Exception as e:
+        logger.warning("reflect_multi_skill failed: %s", e)
+    return {
+        "action": "merge",
+        "reason": "default_merge",
+        "conflict": False,
+        "ordered_indices": list(range(len(parts))),
+        "source": "rule",
+    }
+
+
+def _apply_multi_skill_reflection(
+    coordinator: Any,
+    *,
+    user_input: str,
+    result_parts: List[str],
+    skill_names: List[str],
+    intent: str = "",
+) -> tuple:
+    """Returns (data_block, meta_dict, want_adhoc)."""
+    decision = reflect_multi_skill(
+        coordinator,
+        user_input=user_input,
+        result_parts=result_parts,
+        skill_names=skill_names,
+        intent=intent,
+    )
+    act = (decision.get("action") or "merge").lower()
+    if act == "adhoc":
+        return "", decision, True
+
+    parts = [p for p in result_parts if p and str(p).strip()]
+    idxs = decision.get("ordered_indices") or list(range(len(parts)))
+    clean_idxs = []
+    for i in idxs:
+        try:
+            ii = int(i)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= ii < len(parts) and ii not in clean_idxs:
+            clean_idxs.append(ii)
+    if not clean_idxs:
+        clean_idxs = list(range(len(parts)))
+
+    selected = [parts[i] for i in clean_idxs]
+    header_lines = [
+        "### 多Skill反思",
+        f"action: {act}",
+        f"conflict: {bool(decision.get('conflict') or act == 'conflict')}",
+        f"reason: {decision.get('reason') or ''}",
+    ]
+    if decision.get("notes"):
+        header_lines.append(f"notes: {decision.get('notes')}")
+    if act == "conflict":
+        header_lines.append(
+            "说明: 多来源结论可能不一致，合成时请并列保留并标注来源，勿抹平矛盾。"
+        )
+    header = "\n".join(header_lines)
+    body = "\n\n".join(
+        f"## Skill 参考输出 {i + 1}\n{part}"
+        for i, part in enumerate(selected)
+        if part and str(part).strip()
+    )
+    return f"{header}\n\n{body}".strip(), decision, False
+
+
+async def execution_flash(
+    coordinator: Any,
+    session_id: str,
+    user_input: str,
+) -> str:
 
     coordinator.context.set_component("planner")
-    logger.info("flash mode: skill routing")
+
+    reflection = bool(FLASH_REFLECTION_ENABLED)
+    logger.info("flash mode: skill routing reflection=%s", bool(reflection))
 
     from agent.memory.message_store import message_store
 
@@ -122,6 +485,7 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
 
     coordinator.context.set_component("executor")
     result_parts: List[str] = []
+    executed_skill_names: List[str] = []
 
     for skill_name in skill_names:
         if not skill_name:
@@ -136,8 +500,26 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
             logger.warning("flash: skill %s not found, skip", skill_name)
             continue
 
-        logger.info("flash execute skill-policy2=%s", skill_name)
-        skill_output = await run_skill_policy3(
+        logger.info(
+            "flash execute skill-policy=%s skill=%s reflection=%s",
+            FLASH_SKILL_POLICY,
+            skill_name,
+            bool(reflection),
+        )
+        if skill_name == "norm-answers":
+            skill_output = await run_norm_answers_direct(
+                coordinator,
+                user_input=user_input,
+                session_id=session_id,
+                mcp_tools_cache=mcp_tools_cache,
+            )
+            if skill_output:
+                result_parts.append(skill_output)
+            executed_skill_names.append(skill_name)
+            coordinator._metrics["total_skills_executed"] += 1
+            continue
+
+        skill_output = await run_skill_policy2(
             coordinator,
             skill=skill,
             user_input=user_input,
@@ -146,14 +528,39 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
             mcp_catalog=mcp_catalog,
             prior_results="\n\n".join(result_parts),
             session_history=session_history,
+            reflection=reflection,
         )
         if skill_output:
             result_parts.append(skill_output)
+            executed_skill_names.append(skill_name)
         coordinator._metrics["total_skills_executed"] += 1
 
-    # skill 无有效输出时回退 MCP，避免空转
-    if not result_parts and mcp_tools_cache:
-        logger.info("flash: skill produced nothing; fallback adhoc MCP")
+    want_adhoc = not result_parts
+    multi_meta: Dict[str, Any] = {}
+    data_block = ""
+
+    if reflection and result_parts:
+        data_block, multi_meta, want_adhoc_r = _apply_multi_skill_reflection(
+            coordinator,
+            user_input=user_input,
+            result_parts=result_parts,
+            skill_names=executed_skill_names,
+            intent=route.get("intent") or "",
+        )
+        want_adhoc = want_adhoc or want_adhoc_r
+        logger.info(
+            "flash multi-skill reflection action=%s want_adhoc=%s",
+            multi_meta.get("action"),
+            want_adhoc,
+        )
+
+    # skill 无有效输出 / 反思要求 adhoc 时回退 MCP
+    if want_adhoc and mcp_tools_cache:
+        logger.info(
+            "flash: fallback adhoc MCP (empty=%s reflection_adhoc=%s)",
+            not result_parts,
+            bool(multi_meta.get("action") == "adhoc"),
+        )
         adhoc = await run_adhoc_mcp(
             coordinator,
             user_input=user_input,
@@ -165,15 +572,21 @@ async def execution_flash(coordinator: Any, session_id: str, user_input: str) ->
         )
         if adhoc:
             coordinator._metrics["successful_plans"] += 1
+            if reflection and result_parts:
+                return (
+                    f"### 多Skill反思后补充 MCP\n"
+                    f"reason: {multi_meta.get('reason') or ''}\n\n"
+                    f"{adhoc}"
+                )
             return adhoc
 
     coordinator._metrics["successful_plans"] += 1
-    # skill_output 仅作「参考内容」；最终由 coordinator + 系统提示词再合成用户回答
-    data_block = "\n\n".join(
-        f"## Skill 参考输出 {i + 1}\n{part}"
-        for i, part in enumerate(result_parts)
-        if part and str(part).strip()
-    ).strip()
+    if not data_block:
+        data_block = "\n\n".join(
+            f"## Skill 参考输出 {i + 1}\n{part}"
+            for i, part in enumerate(result_parts)
+            if part and str(part).strip()
+        ).strip()
     if not data_block:
         data_block = (
             "(skill 执行未产生有效参考内容；可能取数失败或未命中业务数据。"
@@ -330,6 +743,48 @@ def plan_adhoc_mcps(
     except Exception as e:
         logger.warning("plan_adhoc_mcps failed: %s", e, exc_info=True)
         return {"need_tools": False, "tools": []}
+
+
+async def run_norm_answers_direct(
+    coordinator: Any,
+    *,
+    user_input: str,
+    session_id: str,
+    mcp_tools_cache: list,
+    mcp_name: str = "match_for_best",
+) -> str:
+    step_text = await invoke_mcp(
+        coordinator,
+        session_id=session_id,
+        user_input=user_input,
+        mcp_name=mcp_name,
+        mcp_tools_cache=mcp_tools_cache,
+        params_hint={"match_string": user_input},
+    )
+    if not (step_text or "").strip():
+        return (
+            "## Skill 执行证据: norm-answers\n"
+            f"用户问题: {user_input}\n"
+            "说明: 实体匹配工具无有效返回；后续请据实处理，勿编造实例名称。"
+        )
+    try:
+        from agent.memory.message_store import message_store
+
+        message_store.append_tool(
+            session_id,
+            step_text,
+            name=mcp_name,
+            meta={"skill": "norm-answers", "path": "direct", "purpose": "entity_match"},
+        )
+    except Exception as e:
+        logger.warning("norm-answers append_tool failed: %s", e)
+    return (
+        f"## Skill 执行证据: norm-answers\n"
+        f"用户问题: {user_input}\n"
+        f"已调用工具: [{mcp_name}]\n"
+        f"\n### 实体匹配结果（后续 skill 须基于最高相似度实例 + 用户原问）\n"
+        f"{step_text}"
+    )
 
 
 async def run_adhoc_mcp(
@@ -657,19 +1112,28 @@ async def run_skill_policy(
     mcp_tools_cache: list,
     mcp_catalog: str,
     prior_results: str = "",
+    session_history: str = "",
+    reflection: bool = False,
 ) -> str:
     """execution_flash
         └─ for skill: run_skill_policy(...)
-           ├─ decide_skill_next_action   # 每轮就很烦 丢 我要弃用你了
+           ├─ decide_skill_next_action
            ├─ resolve_params_for_mcp
            ├─ invoke_mcp
            └─ _build_skill_evidence_package
         └─ 拼 result_parts
+
+    reflection: 与 v3 签名对齐，v1 不实现反思逻辑（仅占位）。
     """
+    _ = reflection  # unused in v1
+    from agent.memory.message_store import message_store
+
     skill_name = getattr(skill, "name", "skill")
     policy = _skill_policy_text(skill)
     allowed_tools = _skill_allowed_tools(skill, mcp_tools_cache)
     allowed_set = set(allowed_tools)
+    if not session_history:
+        session_history = message_store.format_for_prompt(session_id)
 
     # catalog subset for allowed tools only
     allowed_catalog_lines = []
@@ -686,12 +1150,15 @@ async def run_skill_policy(
     )
 
     notes: List[str] = []
+    if session_history:
+        notes.append(f"[session_history]\n{session_history[:4000]}")
     if prior_results:
         notes.append(f"[prior]\n{prior_results[:3000]}")
 
     executed: Set[str] = set()
     last_action = ""
     final_user_text = ""
+    synthesis_constraints = _extract_synthesis_constraints_regex(policy)
 
     for turn in range(1, MAX_SKILL_TURNS + 1):
         context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
@@ -781,6 +1248,18 @@ async def run_skill_policy(
             )
             executed.add(mcp_name)
             notes.append(_format_tool_note(mcp_name, step_text))
+            status = _classify_tool_result_status(step_text or "")
+            message_store.append_tool(
+                session_id,
+                step_text or f"(empty/error status={status})",
+                name=str(mcp_name),
+                meta={
+                    "skill": skill_name,
+                    "purpose": purpose,
+                    "status": status,
+                    "path": "skill_v1",
+                },
+            )
             continue
 
         # unknown action
@@ -794,6 +1273,7 @@ async def run_skill_policy(
         executed=sorted(executed),
         last_action=last_action,
         draft_final=final_user_text,
+        synthesis_constraints=synthesis_constraints,
     )
 
 
@@ -947,6 +1427,9 @@ steps 按执行顺序排列。
                 "action": action,
                 "purpose": item.get("purpose") or item.get("reason") or "",
             }
+            cond = item.get("condition")
+            if cond is not None and str(cond).strip():
+                step["condition"] = str(cond).strip()
             if action == "call_mcp":
                 mcp = item.get("mcp") or item.get("tool")
                 if not mcp:
@@ -963,6 +1446,76 @@ steps 按执行顺序排列。
     except Exception as e:
         logger.warning("plan_skill_execution failed: %s", e, exc_info=True)
         return {"intent": "plan_failed", "reason": str(e), "steps": []}
+
+
+def _last_tool_status_from_notes(notes: List[str]) -> str:
+    """Latest tool note status: ok | empty | error | ''."""
+    for n in reversed(notes or []):
+        if not (n or "").startswith("[tool:"):
+            continue
+        for line in (n or "").splitlines()[:4]:
+            if "status=" in line:
+                # e.g. status=ok chars=123
+                part = line.split("status=", 1)[-1].strip().split()[0]
+                return part.lower()
+        return ""
+    return ""
+
+
+def _plan_condition_holds(condition: str, notes: List[str]) -> Optional[bool]:
+    """Evaluate plan condition against recent notes.
+
+    Returns:
+      True/False when recognized; None when phrasing unknown.
+    Empty condition is not passed here (caller treats empty as unconditional).
+    """
+    cond = (condition or "").strip()
+    if not cond:
+        return True
+    cl = cond.lower()
+    status = _last_tool_status_from_notes(notes)
+    blob = "\n".join(notes[-6:])[:4000].lower()
+
+    fail_markers = (
+        "无数据", "查询不到", "查不到", "为空", "empty", "未找到", "未查询",
+        "没有数据", "无结果", "失败", "error", "无法", "不存在", "未匹配",
+    )
+    ok_markers = (
+        "有数据", "查到", "成功", "status=ok", "存在", "有效", "非空",
+    )
+
+    wants_fail = any(m in cond or m in cl for m in fail_markers)
+    wants_ok = any(m in cond or m in cl for m in ok_markers) and not wants_fail
+
+    if wants_fail:
+        if status in ("empty", "error"):
+            return True
+        if any(m in blob for m in ("status=empty", "status=error", "无数据", "未找到", "[]")):
+            return True
+        return False
+    if wants_ok:
+        if status == "ok":
+            return True
+        if "status=ok" in blob:
+            return True
+        return False
+    return None
+
+
+def _should_run_plan_step(step: Dict[str, Any], notes: List[str]) -> bool:
+    """Gate plan steps by condition. stop with unmet/unknown condition → skip (not break)."""
+    cond = (step.get("condition") or "").strip()
+    if not cond:
+        return True
+    action = (step.get("action") or "").lower().strip()
+    holds = _plan_condition_holds(cond, notes)
+    if action in ("stop", "final_answer", "done"):
+        # stop only when condition clearly holds; unknown → do not stop mid-plan
+        return holds is True
+    # call_mcp / analyze: unknown condition → still run main path
+    if holds is None:
+        return True
+    return holds
 
 
 def _fallback_steps_from_skill(skill: Any, allowed_tools: List[str]) -> List[Dict[str, Any]]:
@@ -1039,6 +1592,7 @@ async def run_skill_policy2(
     mcp_catalog: str,
     prior_results: str = "",
     session_history: str = "",
+    reflection: bool = False,
 ) -> str:
     """
         -- plan_skill_execution: skill全文 + 用户问题 + prior + 允许MCP → 有序 steps
@@ -1103,7 +1657,7 @@ async def run_skill_policy2(
     notes.append(
         f"[plan]\nintent={plan.get('intent') or ''}\n"
         f"reason={plan.get('reason') or ''}\n"
-        f"steps={[(s.get('action'), s.get('mcp'), s.get('purpose')) for s in steps]}"
+        f"steps={[(s.get('action'), s.get('mcp'), s.get('purpose'), s.get('condition') or '') for s in steps]}"
     )
 
     executed: Set[str] = set()
@@ -1112,17 +1666,33 @@ async def run_skill_policy2(
 
     for i, step in enumerate(steps, start=1):
         action = (step.get("action") or "").lower().strip()
-        last_action = action
         purpose = step.get("purpose") or step.get("reason") or ""
+        cond = (step.get("condition") or "").strip()
         context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
         logger.info(
-            "flash skill=%s plan-step=%d/%d action=%s mcp=%s",
+            "flash skill=%s plan-step=%d/%d action=%s mcp=%s condition=%s",
             skill_name,
             i,
             len(steps),
             action,
             step.get("mcp") or "",
+            (cond[:80] if cond else ""),
         )
+
+        if not _should_run_plan_step(step, notes):
+            logger.info(
+                "flash skill=%s skip step %d action=%s condition_not_met=%s",
+                skill_name,
+                i,
+                action,
+                cond[:120],
+            )
+            notes.append(
+                f"[policy] skip step action={action} condition_not_met={cond[:200]}"
+            )
+            continue
+
+        last_action = action
 
         if action in ("stop", "final_answer", "done"):
             final_user_text = (step.get("reason") or purpose or "").strip()
@@ -1131,6 +1701,7 @@ async def run_skill_policy2(
             break
 
         if action == "analyze":
+            continue
             analysis = _analyze_under_plan(
                 coordinator,
                 skill_name=skill_name,
@@ -1214,12 +1785,10 @@ async def run_skill_policy3(
     mcp_catalog: str,
     prior_results: str = "",
     session_history: str = "",
+    reflection: bool = False,
 ) -> str:
-    """Plan cold-start + conditional ReAct + hard guards.
-
-    Drop-in signature for run_skill_policy2. Happy path follows hint plan without
-    per-step decide; failures / empty tools / missing next trigger a short decide.
-    Output remains an evidence package for generate_context.
+    """
+    Plan cold-start + conditional ReAct + hard guards (+ optional Reflection).
     """
     from agent.memory.message_store import message_store
 
@@ -1286,8 +1855,26 @@ async def run_skill_policy3(
     last_action = ""
     final_user_text = ""
     mcp_calls = 0
+    analyze_count = 0
+    # 上次 analyze 时 ok 工具数；无新增 ok 则拒绝再次 analyze
+    tools_ok_at_last_analyze = 0
     consecutive_fail = 0
     force_done = False
+    reflect_llm_used = 0
+    reflect_post_tool_count = 0
+    retry_same_counts: Dict[str, int] = {}
+    pending_reflect_action: Optional[Dict[str, Any]] = None
+    evidence_reflection: Optional[Dict[str, Any]] = None
+
+    def _tools_ok_count() -> int:
+        return sum(1 for s in executed.values() if s == "ok")
+
+    def _analyze_has_new_evidence() -> bool:
+        """相对上次 analyze，是否有新增 status=ok 的工具结果。"""
+        if analyze_count <= 0:
+            return _tools_ok_count() > 0 or bool(executed)
+        # 仅以 ok 工具数量增加为准，避免失败重试触发重复分析
+        return _tools_ok_count() > tools_ok_at_last_analyze
 
     def _tool_allowed(mcp_name: str) -> bool:
         if not allowed_tools:
@@ -1346,7 +1933,14 @@ async def run_skill_policy3(
             or force_done
         ):
             if any(s == "ok" for s in executed.values()):
-                if act != "done" and turn < MAX_SKILL_V3_TURNS and llm_calls < MAX_SKILL_V3_LLM:
+                # 收束：未达 analyze 上限且尚无分析过/有新证据时才强制 analyze
+                if (
+                    act != "done"
+                    and turn < MAX_SKILL_V3_TURNS
+                    and llm_calls < MAX_SKILL_V3_LLM
+                    and analyze_count < MAX_SKILL_V3_ANALYZE
+                    and _analyze_has_new_evidence()
+                ):
                     return {
                         "action": "analyze",
                         "reason": "budget_force_close",
@@ -1368,15 +1962,24 @@ async def run_skill_policy3(
                     "user_message": "执行计划缺少工具名。",
                 }
             if not _tool_allowed(mcp_name):
+                if executed and analyze_count < MAX_SKILL_V3_ANALYZE and _analyze_has_new_evidence():
+                    return {
+                        "action": "analyze",
+                        "reason": f"blocked_tool:{mcp_name}",
+                        "purpose": "工具不在 skill 白名单",
+                    }
                 return {
-                    "action": "analyze" if executed else "stop",
+                    "action": "done" if executed else "stop",
                     "reason": f"blocked_tool:{mcp_name}",
-                    "purpose": "工具不在 skill 白名单",
                     "user_message": f"工具不在技能允许列表: {mcp_name}",
                 }
             prev = executed.get(mcp_name)
             if prev == "ok":
-                if any(s == "ok" for s in executed.values()):
+                if (
+                    any(s == "ok" for s in executed.values())
+                    and analyze_count < MAX_SKILL_V3_ANALYZE
+                    and _analyze_has_new_evidence()
+                ):
                     return {
                         "action": "analyze",
                         "reason": f"skip_repeat_ok:{mcp_name}",
@@ -1395,12 +1998,33 @@ async def run_skill_policy3(
                     "reason": "mcp_budget",
                 }
 
-        if act == "analyze" and not executed:
-            return {
-                "action": "stop",
-                "reason": "analyze_without_data",
-                "user_message": "尚无工具数据，无法分析。",
-            }
+        if act == "analyze":
+            if not executed:
+                return {
+                    "action": "stop",
+                    "reason": "analyze_without_data",
+                    "user_message": "尚无工具数据，无法分析。",
+                }
+            if analyze_count >= MAX_SKILL_V3_ANALYZE:
+                return {
+                    "action": "done",
+                    "reason": "analyze_cap",
+                }
+            if not _analyze_has_new_evidence():
+                # 无新工具证据：跳过重复 analyze（plan 里多段 analyze 或 decide 死循环）
+                return {
+                    "action": "done" if analyze_count > 0 else "stop",
+                    "reason": "analyze_no_new_evidence",
+                    "user_message": (
+                        "" if analyze_count > 0
+                        else "尚无有效工具结果可供分析。"
+                    ),
+                }
+            if last_action == "analyze":
+                return {
+                    "action": "done",
+                    "reason": "analyze_consecutive_dedupe",
+                }
 
         out = dict(action)
         out["action"] = act
@@ -1414,12 +2038,26 @@ async def run_skill_policy3(
             act = (step.get("action") or "").lower().strip()
             if act in ("final_answer", "done"):
                 act = "stop"
+            cond = (step.get("condition") or "").strip()
+            if cond and not _should_run_plan_step(step, notes):
+                logger.info(
+                    "flash v3 skill=%s skip hint action=%s condition_not_met=%s",
+                    skill_name,
+                    act,
+                    cond[:120],
+                )
+                notes.append(
+                    f"[policy] skip hint action={act} condition_not_met={cond[:200]}"
+                )
+                continue
             out: Dict[str, Any] = {
                 "action": act,
                 "purpose": step.get("purpose") or step.get("reason") or "",
                 "reason": step.get("reason") or "hint_plan",
                 "source": "hint",
             }
+            if cond:
+                out["condition"] = cond
             if act == "call_mcp":
                 out["mcp"] = step.get("mcp") or step.get("tool") or ""
             if act == "stop":
@@ -1463,10 +2101,10 @@ Skill: {skill_name}
 - done: 流程可结束（不要写完整报告）
 - stop: 需用户补充或无法继续，填 user_message
 
-规则:
+        规则:
 1. 禁止重复调用 status=ok 的工具
 2. empty/error 后若无新参数线索，优先 stop 或换允许的其它工具
-3. 有 ok 数据时优先 analyze 或 done
+3. 有 ok 数据时优先 analyze 或 done；analyze 全 skill 最多 {MAX_SKILL_V3_ANALYZE} 次，无新 ok 工具时不要再 analyze
 4. 只输出合法 JSON，不要 markdown
 
 格式:
@@ -1495,48 +2133,137 @@ Skill: {skill_name}
         }
 
     for turn in range(1, MAX_SKILL_V3_TURNS + 1):
+        # Reflect-1 injection: consume one-shot action from previous tool observation
+        if reflection and pending_reflect_action is not None:
+            action = dict(pending_reflect_action)
+            pending_reflect_action = None
+            action = _guard_action(action, turn)
+            act = (action.get("action") or "").lower().strip()
+            last_action = act
+            purpose = action.get("purpose") or action.get("reason") or ""
+            logger.info(
+                "flash v3 skill=%s turn=%d action=%s source=reflect_1 mcp=%s reason=%s",
+                skill_name,
+                turn,
+                act,
+                action.get("mcp") or "",
+                (action.get("reason") or "")[:100],
+            )
+            if act in ("stop", "done", "final_answer", "need_user"):
+                final_user_text = (
+                    action.get("user_message")
+                    or action.get("reason")
+                    or purpose
+                    or ""
+                ).strip()
+                if final_user_text:
+                    notes.append(f"[final]\n{final_user_text}")
+                if act == "need_user":
+                    last_action = "stop"
+                break
+            if act == "analyze":
+                context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
+                if (
+                    llm_calls < MAX_SKILL_V3_LLM
+                    and analyze_count < MAX_SKILL_V3_ANALYZE
+                    and _analyze_has_new_evidence()
+                ):
+                    llm_calls += 1
+                    analyze_count += 1
+                    tools_ok_at_last_analyze = _tools_ok_count()
+                    analysis = _analyze_under_plan(
+                        coordinator,
+                        skill_name=skill_name,
+                        policy=policy,
+                        user_input=user_input,
+                        purpose=purpose,
+                        context=context,
+                    )
+                    if analysis:
+                        notes.append(f"[analysis]\n{analysis}")
+                        _push_obs("analyze", "analyze", "ok", purpose, analysis)
+                    else:
+                        _push_obs("analyze", "analyze", "empty", purpose, "")
+                else:
+                    notes.append(
+                        f"[policy] skip analyze "
+                        f"(count={analyze_count}/{MAX_SKILL_V3_ANALYZE} "
+                        f"new_evidence={_analyze_has_new_evidence()})"
+                    )
+                force_done = True
+                continue
+            if act in ("retry_same", "switch_tool", "call_mcp"):
+                # fall through into normal call_mcp path via synthetic action
+                if act != "call_mcp":
+                    action["action"] = "call_mcp"
+                # skip hint/decide selection; jump to execute block using action
+                use_decide = False
+                # set flags so we don't overwrite action below
+                _reflect_force_action = True
+            else:
+                # continue_hint -> normal loop selection
+                _reflect_force_action = False
+        else:
+            _reflect_force_action = False
+
         use_decide = False
         if observations:
             last = observations[-1]
             if last.get("status") in ("empty", "error") or last.get("kind") == "guard":
                 use_decide = True
 
-        if hint_idx >= len(steps) and not force_done:
-            if any(s == "ok" for s in executed.values()):
-                action = {
-                    "action": "analyze" if last_action != "analyze" else "done",
-                    "reason": "hint_exhausted",
-                    "source": "hint",
-                }
-            else:
-                use_decide = True
-                action = _decide_next()
-        elif use_decide:
-            action = _decide_next()
-        else:
-            action = _next_hint()
-            if action is None:
+        if not _reflect_force_action:
+            if hint_idx >= len(steps) and not force_done:
                 if any(s == "ok" for s in executed.values()):
-                    action = {
-                        "action": "done",
-                        "reason": "no_more_hint",
-                        "source": "hint",
-                    }
+                    if (
+                        analyze_count < MAX_SKILL_V3_ANALYZE
+                        and last_action != "analyze"
+                        and _analyze_has_new_evidence()
+                    ):
+                        action = {
+                            "action": "analyze",
+                            "reason": "hint_exhausted",
+                            "source": "hint",
+                        }
+                    else:
+                        action = {
+                            "action": "done",
+                            "reason": "hint_exhausted_done",
+                            "source": "hint",
+                        }
                 else:
+                    use_decide = True
                     action = _decide_next()
+            elif use_decide:
+                action = _decide_next()
+            else:
+                action = _next_hint()
+                if action is None:
+                    if any(s == "ok" for s in executed.values()):
+                        action = {
+                            "action": "done",
+                            "reason": "no_more_hint",
+                            "source": "hint",
+                        }
+                    else:
+                        action = _decide_next()
 
-        action = _guard_action(action, turn)
+            action = _guard_action(action, turn)
+        else:
+            action = _guard_action(action, turn)
         act = (action.get("action") or "").lower().strip()
         last_action = act
         purpose = action.get("purpose") or action.get("reason") or ""
         logger.info(
-            "flash v3 skill=%s turn=%d action=%s source=%s mcp=%s reason=%s",
+            "flash v3 skill=%s turn=%d action=%s source=%s mcp=%s reason=%s analyze=%d/%d",
             skill_name,
             turn,
             act,
             action.get("source") or "",
             action.get("mcp") or "",
             (action.get("reason") or "")[:100],
+            analyze_count,
+            MAX_SKILL_V3_ANALYZE,
         )
 
         if act in ("stop", "done", "final_answer"):
@@ -1556,7 +2283,19 @@ Skill: {skill_name}
                 notes.append("[analysis]\n(llm budget, skip analyze)")
                 force_done = True
                 continue
+            if analyze_count >= MAX_SKILL_V3_ANALYZE:
+                notes.append(
+                    f"[policy] analyze cap reached ({MAX_SKILL_V3_ANALYZE}), done"
+                )
+                force_done = True
+                continue
+            if not _analyze_has_new_evidence():
+                notes.append("[policy] skip analyze (no new tool evidence)")
+                force_done = True
+                continue
             llm_calls += 1
+            analyze_count += 1
+            tools_ok_at_last_analyze = _tools_ok_count()
             analysis = _analyze_under_plan(
                 coordinator,
                 skill_name=skill_name,
@@ -1629,10 +2368,653 @@ Skill: {skill_name}
                 consecutive_fail = 0
             else:
                 consecutive_fail += 1
+
+            # Reflect-1: observation enough? switch? stop?
+            if (
+                reflection
+                and reflect_post_tool_count < MAX_REFLECT_POST_TOOL
+                and status in ("empty", "error", "ok")
+            ):
+                # happy path ok: rule only continue; still count lightly
+                remaining_hint = str(
+                    [(s.get("action"), s.get("mcp")) for s in steps[hint_idx: hint_idx + 5]]
+                )
+                r1 = reflect_after_tool(
+                    coordinator,
+                    skill_name=skill_name,
+                    user_input=user_input,
+                    tool_name=str(mcp_name),
+                    status=status,
+                    purpose=purpose,
+                    snippet=step_text or "",
+                    executed=executed,
+                    allowed_tools=allowed_tools,
+                    remaining_hint=remaining_hint,
+                    retry_same_count=retry_same_counts.get(str(mcp_name), 0),
+                )
+                if r1.get("source") == "llm":
+                    reflect_llm_used += 1
+                    if reflect_llm_used > MAX_REFLECT_LLM_PER_SKILL:
+                        r1 = {
+                            "enough": status == "ok",
+                            "action": "continue_hint" if status == "ok" else (
+                                "analyze" if any(s == "ok" for s in executed.values()) else "need_user"
+                            ),
+                            "reason": "reflect_llm_budget",
+                            "source": "rule",
+                            "user_message": "取数不完整，请补充对象名称或稍后重试。"
+                            if status != "ok" and not any(s == "ok" for s in executed.values())
+                            else "",
+                        }
+                reflect_post_tool_count += 1
+                notes.append(
+                    f"[reflect_1]\naction={r1.get('action')} enough={r1.get('enough')} "
+                    f"reason={r1.get('reason')} source={r1.get('source')}"
+                )
+                act1 = (r1.get("action") or "continue_hint").lower()
+                if act1 == "continue_hint" and status == "ok":
+                    pass  # normal continue
+                elif act1 == "retry_same":
+                    retry_same_counts[str(mcp_name)] = retry_same_counts.get(str(mcp_name), 0) + 1
+                    pending_reflect_action = {
+                        "action": "call_mcp",
+                        "mcp": str(mcp_name),
+                        "purpose": purpose or "reflect retry_same",
+                        "reason": r1.get("reason") or "retry_same",
+                        "source": "reflect_1",
+                    }
+                elif act1 == "switch_tool":
+                    sw = (r1.get("mcp") or "").strip()
+                    if sw:
+                        pending_reflect_action = {
+                            "action": "call_mcp",
+                            "mcp": sw,
+                            "purpose": r1.get("purpose") or "reflect switch_tool",
+                            "reason": r1.get("reason") or "switch_tool",
+                            "source": "reflect_1",
+                        }
+                elif act1 == "analyze":
+                    pending_reflect_action = {
+                        "action": "analyze",
+                        "purpose": r1.get("purpose") or "reflect analyze",
+                        "reason": r1.get("reason") or "analyze",
+                        "source": "reflect_1",
+                    }
+                elif act1 in ("need_user", "stop", "done"):
+                    pending_reflect_action = {
+                        "action": "stop" if act1 == "need_user" else act1,
+                        "reason": r1.get("reason") or act1,
+                        "user_message": r1.get("user_message") or "",
+                        "source": "reflect_1",
+                    }
             continue
 
         notes.append(f"[policy] unknown v3 action: {act}")
         _push_obs("guard", act, "error", purpose, f"unknown action {act}")
+        break
+
+    # Reflect-2: evidence sufficiency (skill package)
+    if reflection:
+        ev_preview = build_policy_context(
+            [
+                n
+                for n in notes
+                if not (n or "").startswith("[prior]")
+                and not (n or "").startswith("[session_history]")
+            ],
+            limit=min(RESULT_SNIPPET_LIMIT, 12000),
+        )
+        evidence_reflection = reflect_evidence_sufficiency(
+            coordinator,
+            skill_name=skill_name,
+            user_input=user_input,
+            evidence=ev_preview,
+            executed=sorted(executed.keys()),
+            last_action=last_action,
+        )
+        notes.append(
+            f"[reflect_2]\nsupported={evidence_reflection.get('supported')} "
+            f"coverage={evidence_reflection.get('coverage')} "
+            f"next={evidence_reflection.get('next')} "
+            f"gaps={evidence_reflection.get('gaps')} "
+            f"reason={evidence_reflection.get('reason')}"
+        )
+        if (evidence_reflection.get("next") or "") in ("need_user", "stop"):
+            msg = (
+                evidence_reflection.get("reason")
+                or "证据不足以完整回答，请补充关键信息。"
+            )
+            if not final_user_text:
+                final_user_text = str(msg)
+            if last_action not in ("stop", "done"):
+                last_action = "stop"
+
+    return _build_skill_evidence_package(
+        skill_name=skill_name,
+        user_input=user_input,
+        notes=notes,
+        executed=sorted(executed.keys()),
+        last_action=last_action,
+        draft_final=final_user_text,
+        synthesis_constraints=synthesis_constraints,
+        reflection_meta=evidence_reflection if reflection else None,
+    )
+
+
+async def run_skill_policy4(
+    coordinator: Any,
+    *,
+    skill: Any,
+    user_input: str,
+    session_id: str,
+    mcp_tools_cache: list,
+    mcp_catalog: str,
+    prior_results: str = "",
+    session_history: str = "",
+) -> str:
+    """ ReAct：每轮 Thought→Action→Observation，无 cold-start plan；产出证据包。
+
+    循环：
+      decide(LLM) → call_mcp | analyze | done | stop
+      call_mcp → 填参 → invoke → 写入 notes（Observation）
+    硬门控：turns / llm / mcp / analyze 上限、工具白名单、不重复 ok 工具。
+    """
+    from agent.memory.message_store import message_store
+
+    skill_name = getattr(skill, "name", "skill")
+    policy = _skill_policy_text(skill)
+    allowed_tools = _skill_allowed_tools(skill, mcp_tools_cache)
+    allowed_set = set(allowed_tools)
+    if not session_history:
+        session_history = message_store.format_for_prompt(session_id)
+
+    allowed_catalog_lines = []
+    for tool in mcp_tools_cache or []:
+        name = getattr(tool, "name", str(tool))
+        if name in allowed_set or any(
+            name.endswith(a) or a.endswith(name) for a in allowed_tools
+        ):
+            desc = (getattr(tool, "description", None) or "")[:160]
+            args = format_tool_args_for_prompt(tool)
+            allowed_catalog_lines.append(f"- {name}: {desc}\n  args: {args}")
+    tools_text = "\n".join(allowed_catalog_lines) if allowed_catalog_lines else (
+        "allowed tool names: " + ", ".join(allowed_tools)
+    )
+    synthesis_constraints = _extract_synthesis_constraints_regex(policy)
+
+    notes: List[str] = []
+    if session_history:
+        notes.append(f"[session_history]\n{session_history[:4000]}")
+    if prior_results:
+        notes.append(f"[prior]\n{prior_results[:3000]}")
+    notes.append("[react]\nmode=classic Thought-Action-Observation (policy4)")
+
+    executed: Dict[str, str] = {}
+    last_action = ""
+    final_user_text = ""
+    llm_calls = 0
+    mcp_calls = 0
+    analyze_count = 0
+    tools_ok_at_last_analyze = 0
+    consecutive_fail = 0
+
+    def _tools_ok_count() -> int:
+        return sum(1 for s in executed.values() if s == "ok")
+
+    def _tool_allowed(mcp_name: str) -> bool:
+        if not allowed_tools:
+            return True
+        return any(
+            mcp_name == a or mcp_name.endswith(a) or a.endswith(mcp_name)
+            for a in allowed_tools
+        )
+
+    def _analyze_has_new_evidence() -> bool:
+        if analyze_count <= 0:
+            return _tools_ok_count() > 0 or bool(executed)
+        return _tools_ok_count() > tools_ok_at_last_analyze
+
+    def _obs_blob(limit: int = 6000) -> str:
+        return build_policy_context(
+            [
+                n
+                for n in notes
+                if not (n or "").startswith("[prior]")
+                and not (n or "").startswith("[session_history]")
+            ],
+            limit=limit,
+        )
+
+    def _bootstrap_first_tool() -> Optional[Dict[str, Any]]:
+        """Decide 失败且尚无数据时：按 skill 允许列表点名第一个未执行工具（跟 Workflow 顺序一致）。"""
+        pool = list(allowed_tools or [])
+        if not pool:
+            return None
+        # 优先「列表/查询」类首步（如 unit_select_incidents）
+        preferred = []
+        for name in pool:
+            low = name.lower()
+            if any(k in low for k in ("select", "list", "search", "query", "match")):
+                preferred.append(name)
+        ordered = preferred + [n for n in pool if n not in preferred]
+        for name in ordered:
+            if executed.get(name) == "ok":
+                continue
+            if executed.get(name) in ("empty", "error") and consecutive_fail >= 2:
+                continue
+            return {
+                "action": "call_mcp",
+                "mcp": name,
+                "purpose": "skill workflow first step (react bootstrap after decide parse fail)",
+                "reason": "bootstrap_first_tool",
+                "thought": "decide JSON 失败，按 skill 允许工具顺序冷启动",
+                "source": "bootstrap",
+            }
+        return None
+
+    def _parse_react_action(raw: str) -> Optional[Dict[str, Any]]:
+        if not (raw or "").strip():
+            return None
+        try:
+            data = parse_json(raw)
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data.get("action"):
+            return data
+        # 再宽松：action 行 + mcp 行
+        text = raw or ""
+        m = re.search(
+            r"action\s*[:=]\s*[\"']?(call_mcp|analyze|done|stop|final_answer)[\"']?",
+            text,
+            re.I,
+        )
+        if not m:
+            return None
+        act = m.group(1).lower()
+        if act == "final_answer":
+            act = "done"
+        out: Dict[str, Any] = {"action": act, "reason": "loose_react_parse", "source": "react"}
+        mm = re.search(r"mcp\s*[:=]\s*[\"']?([a-zA-Z0-9_\-\.]+)[\"']?", text)
+        if mm:
+            out["mcp"] = mm.group(1)
+        pm = re.search(r"purpose\s*[:=]\s*[\"']([^\"']+)[\"']", text)
+        if pm:
+            out["purpose"] = pm.group(1)
+        return out
+
+    def _react_decide(turn: int) -> Dict[str, Any]:
+        nonlocal llm_calls
+        if llm_calls >= MAX_SKILL_V4_LLM:
+            if _tools_ok_count() > 0:
+                return {
+                    "action": "done" if analyze_count > 0 else "analyze",
+                    "thought": "llm budget",
+                    "reason": "llm_budget",
+                    "source": "budget",
+                }
+            boot = _bootstrap_first_tool()
+            if boot and mcp_calls < MAX_SKILL_V4_MCP:
+                return boot
+            return {
+                "action": "stop",
+                "thought": "llm budget no data",
+                "reason": "llm_budget",
+                "user_message": "推理预算用尽且无有效数据，请补充机组/设备名称。",
+                "source": "budget",
+            }
+        allow_list = ", ".join(allowed_tools) if allowed_tools else "(all loaded)"
+        remaining = (
+            [a for a in allowed_tools if executed.get(a) != "ok"]
+            if allowed_tools
+            else []
+        )
+        policy_snip = (policy or "")[:5000]
+        tools_snip = (tools_text or "")[:5000]
+        obs = _obs_blob()
+        history_snip = (session_history or "")[:2000]
+        prompt = f"""你是 ReAct 智能体（Thought → Action → Observation 循环）。
+当前 Skill 为权威业务规则；你只决定下一步一个 Action，不要写最终用户长报告。
+
+Skill: {skill_name}
+Turn: {turn}/{MAX_SKILL_V4_TURNS}
+用户问题: {user_input}
+
+# Skill 规则
+{policy_snip}
+
+# 可调用 MCP（仅允许列表）
+{tools_snip}
+允许工具: {allow_list}
+已执行工具状态: {executed or {}}
+剩余可试: {remaining or allow_list}
+analyze 已用: {analyze_count}/{MAX_SKILL_V4_ANALYZE}
+mcp 已用: {mcp_calls}/{MAX_SKILL_V4_MCP}
+
+# 会话历史（可空）
+{history_snip if history_snip else "(空)"}
+
+# 已有 Observation（工具结果/中间分析）
+{obs if obs else "(尚无)"}
+
+Action 仅可：
+- call_mcp: 取数。填 mcp（必须在允许列表）、purpose。不要填 params。
+- analyze: 基于已有 ok 工具结果做短分析（无新 ok 数据不要 analyze）。
+- done: 证据已够，结束本 skill（证据交给外层成文）。
+- stop: 需用户补充或无法继续，填 user_message。
+
+硬规则：
+1. 严格遵循 Skill Workflow / 分支 / 停止条件；尚无取数时优先 call_mcp 走 Workflow 第一步。
+2. 禁止重复调用 status=ok 的工具。
+3. 禁止调用不在允许列表的工具。
+4. 无工具数据时不要 analyze，也不要无故 stop。
+5. analyze 全 skill 最多 {MAX_SKILL_V4_ANALYZE} 次。
+6. 有足够 ok 数据后应 analyze 或 done，不要空转。
+7. 只输出一行合法 JSON，不要 markdown、不要解释。
+
+格式:
+{{"thought":"简短推理","action":"call_mcp|analyze|done|stop","mcp":"","purpose":"","reason":"","user_message":""}}
+"""
+        raw = ""
+        data: Optional[Dict[str, Any]] = None
+        for attempt in range(2):
+            if llm_calls >= MAX_SKILL_V4_LLM:
+                break
+            llm_calls += 1
+            try:
+                if attempt == 0:
+                    raw = coordinator.llm_client.invoke(
+                        prompt, temperature=0.1, max_tokens=800
+                    ) or ""
+                else:
+                    # 严格重试：极短 prompt，强制 JSON
+                    retry = (
+                        f"只输出 JSON 对象，无其它文字。\n"
+                        f"Skill={skill_name}\n问题={user_input}\n"
+                        f"允许工具={allow_list}\n已执行={executed}\n"
+                        f"尚无 Observation 时必须 action=call_mcp 并选 Workflow 第一步工具。\n"
+                        f'{{"thought":"...","action":"call_mcp|analyze|done|stop",'
+                        f'"mcp":"工具名或空","purpose":"...","reason":"...","user_message":""}}'
+                    )
+                    raw = coordinator.llm_client.invoke(
+                        retry, temperature=0.0, max_tokens=400
+                    ) or ""
+                data = _parse_react_action(raw)
+                if data and data.get("action"):
+                    break
+                logger.warning(
+                    "flash v4 react decide parse empty attempt=%d raw_snip=%r",
+                    attempt + 1,
+                    (raw or "")[:240],
+                )
+            except Exception as e:
+                logger.warning(
+                    "flash v4 react decide failed attempt=%d: %s raw_snip=%r",
+                    attempt + 1,
+                    e,
+                    (raw or "")[:240],
+                )
+                data = None
+
+        if data and data.get("action"):
+            data["source"] = data.get("source") or "react"
+            if data.get("thought"):
+                notes.append(f"[thought]\n{str(data.get('thought'))[:500]}")
+            # 无数据却 analyze/done → 改 bootstrap
+            act0 = str(data.get("action") or "").lower()
+            if act0 in ("analyze", "done") and not executed:
+                boot = _bootstrap_first_tool()
+                if boot:
+                    notes.append("[policy] override empty-state analyze/done → bootstrap tool")
+                    return boot
+            if act0 == "stop" and not executed and turn <= 2:
+                boot = _bootstrap_first_tool()
+                if boot:
+                    notes.append("[policy] override early stop → bootstrap tool")
+                    return boot
+            return data
+
+        # 解析全失败：有数据则收束；无数据则按 skill 工具表继续 ReAct，绝不空 stop
+        if _tools_ok_count() > 0:
+            return {
+                "action": "done" if analyze_count > 0 else "analyze",
+                "thought": "decide failed fallback",
+                "reason": "decide_fail_fallback",
+                "source": "react",
+            }
+        boot = _bootstrap_first_tool()
+        if boot:
+            logger.info(
+                "flash v4 bootstrap skill=%s mcp=%s after decide fail",
+                skill_name,
+                boot.get("mcp"),
+            )
+            notes.append(
+                f"[policy] decide parse failed; bootstrap mcp={boot.get('mcp')}"
+            )
+            return boot
+        return {
+            "action": "stop",
+            "reason": "decide_failed_no_tools",
+            "user_message": "技能未配置可用工具或决策失败，请补充机组/设备名称后重试。",
+            "source": "react",
+        }
+
+    def _guard(action: Dict[str, Any], turn: int) -> Dict[str, Any]:
+        act = (action.get("action") or "").lower().strip()
+        if act in ("final_answer", "finish"):
+            act = "done"
+        if turn >= MAX_SKILL_V4_TURNS or llm_calls >= MAX_SKILL_V4_LLM or mcp_calls >= MAX_SKILL_V4_MCP:
+            if _tools_ok_count() > 0:
+                if (
+                    act != "done"
+                    and analyze_count < MAX_SKILL_V4_ANALYZE
+                    and _analyze_has_new_evidence()
+                    and llm_calls < MAX_SKILL_V4_LLM
+                ):
+                    return {
+                        "action": "analyze",
+                        "reason": "budget_force_analyze",
+                        "purpose": "预算将尽，收束已有数据",
+                        "source": "guard",
+                    }
+                return {"action": "done", "reason": "budget_done", "source": "guard"}
+            return {
+                "action": "stop",
+                "reason": "budget_no_data",
+                "user_message": "未能在预算内取得有效业务数据，请补充对象名称或稍后重试。",
+                "source": "guard",
+            }
+
+        if act == "call_mcp":
+            mcp_name = (action.get("mcp") or action.get("tool") or "").strip()
+            if not mcp_name:
+                return {
+                    "action": "stop",
+                    "reason": "missing_mcp",
+                    "user_message": "缺少工具名。",
+                    "source": "guard",
+                }
+            if not _tool_allowed(mcp_name):
+                if _tools_ok_count() > 0 and analyze_count < MAX_SKILL_V4_ANALYZE:
+                    return {
+                        "action": "analyze",
+                        "reason": f"blocked:{mcp_name}",
+                        "purpose": "工具不在白名单",
+                        "source": "guard",
+                    }
+                return {
+                    "action": "done" if executed else "stop",
+                    "reason": f"blocked:{mcp_name}",
+                    "user_message": f"工具不在技能允许列表: {mcp_name}",
+                    "source": "guard",
+                }
+            prev = executed.get(mcp_name)
+            if prev == "ok":
+                if (
+                    _tools_ok_count() > 0
+                    and analyze_count < MAX_SKILL_V4_ANALYZE
+                    and _analyze_has_new_evidence()
+                ):
+                    return {
+                        "action": "analyze",
+                        "reason": f"skip_repeat_ok:{mcp_name}",
+                        "purpose": "工具已成功，改为分析",
+                        "source": "guard",
+                    }
+                return {"action": "done", "reason": f"skip_repeat_ok:{mcp_name}", "source": "guard"}
+            if prev in ("empty", "error") and consecutive_fail >= 2:
+                if _tools_ok_count() > 0:
+                    return {
+                        "action": "analyze" if analyze_count < MAX_SKILL_V4_ANALYZE else "done",
+                        "reason": "repeated_fail_to_analyze",
+                        "source": "guard",
+                    }
+                return {
+                    "action": "stop",
+                    "reason": "repeated_tool_fail",
+                    "user_message": "多次取数失败或为空，请核对对象名称/时间范围后重试。",
+                    "source": "guard",
+                }
+            if mcp_calls >= MAX_SKILL_V4_MCP:
+                return {
+                    "action": "done" if executed else "stop",
+                    "reason": "mcp_budget",
+                    "source": "guard",
+                }
+
+        if act == "analyze":
+            if not executed:
+                return {
+                    "action": "stop",
+                    "reason": "analyze_without_data",
+                    "user_message": "尚无工具数据，无法分析。",
+                    "source": "guard",
+                }
+            if analyze_count >= MAX_SKILL_V4_ANALYZE:
+                return {"action": "done", "reason": "analyze_cap", "source": "guard"}
+            if not _analyze_has_new_evidence():
+                return {
+                    "action": "done" if analyze_count > 0 else "stop",
+                    "reason": "analyze_no_new_evidence",
+                    "source": "guard",
+                }
+            if last_action == "analyze":
+                return {"action": "done", "reason": "analyze_consecutive_dedupe", "source": "guard"}
+
+        out = dict(action)
+        out["action"] = act
+        return out
+
+    logger.info(
+        "flash v4 pure-react skill=%s allowed_tools=%d",
+        skill_name,
+        len(allowed_tools or []),
+    )
+
+    for turn in range(1, MAX_SKILL_V4_TURNS + 1):
+        action = _react_decide(turn)
+        action = _guard(action, turn)
+        act = (action.get("action") or "").lower().strip()
+        last_action = act
+        purpose = action.get("purpose") or action.get("reason") or ""
+        logger.info(
+            "flash v4 skill=%s turn=%d action=%s mcp=%s reason=%s llm=%d mcp_calls=%d analyze=%d",
+            skill_name,
+            turn,
+            act,
+            action.get("mcp") or "",
+            (action.get("reason") or "")[:100],
+            llm_calls,
+            mcp_calls,
+            analyze_count,
+        )
+
+        if act in ("stop", "done"):
+            final_user_text = (
+                action.get("user_message")
+                or action.get("reason")
+                or purpose
+                or ""
+            ).strip()
+            if final_user_text:
+                notes.append(f"[final]\n{final_user_text}")
+            break
+
+        if act == "analyze":
+            if llm_calls >= MAX_SKILL_V4_LLM or analyze_count >= MAX_SKILL_V4_ANALYZE:
+                notes.append("[policy] skip analyze (budget/cap)")
+                break
+            if not _analyze_has_new_evidence():
+                notes.append("[policy] skip analyze (no new evidence)")
+                break
+            context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
+            # analyze 也算一轮 LLM（_analyze_under_plan 内部再调一次）
+            analysis = _analyze_under_plan(
+                coordinator,
+                skill_name=skill_name,
+                policy=policy,
+                user_input=user_input,
+                purpose=purpose,
+                context=context,
+            )
+            llm_calls += 1
+            analyze_count += 1
+            tools_ok_at_last_analyze = _tools_ok_count()
+            if analysis:
+                notes.append(f"[analysis]\n{analysis}")
+            else:
+                notes.append("[analysis]\n(empty)")
+            continue
+
+        if act == "call_mcp":
+            mcp_name = (action.get("mcp") or action.get("tool") or "").strip()
+            if not mcp_name or not _tool_allowed(mcp_name):
+                notes.append(f"[policy] call_mcp blocked/missing: {mcp_name}")
+                continue
+            context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
+            params = resolve_params_for_mcp(
+                coordinator,
+                mcp_name=mcp_name,
+                mcp_tools_cache=mcp_tools_cache,
+                user_input=user_input,
+                session_id=session_id,
+                purpose=purpose,
+                accumulated_results=context,
+            )
+            if isinstance(action.get("params"), dict) and action["params"]:
+                for k, v in action["params"].items():
+                    if k not in params or params[k] is None:
+                        params[k] = v
+            step_text = await invoke_mcp(
+                coordinator,
+                session_id=session_id,
+                user_input=user_input,
+                mcp_name=mcp_name,
+                mcp_tools_cache=mcp_tools_cache,
+                params_hint=params,
+            )
+            mcp_calls += 1
+            status = _classify_tool_result_status(step_text or "")
+            executed[str(mcp_name)] = status
+            notes.append(_format_tool_note(str(mcp_name), step_text))
+            message_store.append_tool(
+                session_id,
+                step_text or f"(empty/error status={status})",
+                name=str(mcp_name),
+                meta={
+                    "skill": skill_name,
+                    "purpose": purpose,
+                    "status": status,
+                    "path": "skill_v4_react",
+                },
+            )
+            if status == "ok":
+                consecutive_fail = 0
+            else:
+                consecutive_fail += 1
+            continue
+
+        notes.append(f"[policy] unknown v4 action: {act}")
         break
 
     return _build_skill_evidence_package(
@@ -1644,7 +3026,6 @@ Skill: {skill_name}
         draft_final=final_user_text,
         synthesis_constraints=synthesis_constraints,
     )
-
 
 
 # Skill 成文约束标题：匹配到则截取到下一同级/上级标题或文末；匹配不到返回空
@@ -1699,6 +3080,7 @@ def _build_skill_evidence_package(
     last_action: str = "",
     draft_final: str = "",
     synthesis_constraints: str = "",
+    reflection_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Package skill run as reference content for the synthesis layer."""
     # 排除会话历史 / prior：只给合成层本轮 tool 与分析证据 + 成文约束
@@ -1735,6 +3117,17 @@ def _build_skill_evidence_package(
         parts.append("\n### 工具结果与中间分析\n(无)")
     if draft:
         parts.append(f"\n### 策略备注（非最终用户报告）\n{draft}")
+    if reflection_meta:
+        gaps = reflection_meta.get("gaps") or []
+        parts.append(
+            "\n### 证据充分性反思\n"
+            f"supported: {reflection_meta.get('supported')}\n"
+            f"coverage: {reflection_meta.get('coverage')}\n"
+            f"next: {reflection_meta.get('next')}\n"
+            f"gaps: {gaps}\n"
+            f"reason: {reflection_meta.get('reason') or ''}\n"
+            f"source: {reflection_meta.get('source') or ''}"
+        )
     return "\n".join(parts).strip()
 
 

@@ -401,9 +401,6 @@ def resolve_step_params(
 ISO: {now_iso}
 本地: {now_human}
 
-session_id:
-{session_id}
-
 调用目的：
 {purpose or "(无)"}
 
@@ -432,14 +429,12 @@ session_id:
    - 但历史中已出现的编码/名称可直接复用。
  7. required 参数必须填写；如果当前句与历史都无法确定，不要猜测。
  8. optional 参数没有依据可以省略，不填 null。
- 9. 相对时间必须基于当前时间：
-   - 支持 num + time_unit 时优先使用；
-   - 使用 start_time/end_time 时，end_time 为当前时间，start_time 按时间范围向前计算。
+ 9. 使用 start_time/end_time 时，格式为 ISO 8601。
  10. 如果工具无需参数，输出 {{}}。
  11. 一次只生成当前 MCP 调用参数。
 
 输出示例：
-{{"unit_name":"京燃","num":"1","time_unit":"month"}}
+{{"unit_name":"京燃","start_time":"2026-01-01T00:00:00Z","end_time":"2026-01-02T00:00:00Z"}}
 """
     try:
         response = coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=1024)
