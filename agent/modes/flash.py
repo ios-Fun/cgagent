@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 #  v2 Max agent turns per skill (call_mcp / analyze / done)
 MAX_SKILL_TURNS = 15
 MAX_ADHOC_MCP_CALLS = 3
-RESULT_SNIPPET_LIMIT = 50000
-MAX_TOOL_NOTE_CHARS = 20000
+RESULT_SNIPPET_LIMIT = 100000
+MAX_TOOL_NOTE_CHARS = 100000
 
 # v3: plan + conditional react budgets
 MAX_SKILL_V3_TURNS = 20
@@ -44,10 +44,10 @@ MAX_REFLECT_LLM_PER_SKILL = 2
 MAX_REFLECT_RETRY_SAME = 1
 MAX_REFLECT_POST_TOOL = 3
 # Manual switch: set True to enable Reflection in flash (no API wiring)
-FLASH_REFLECTION_ENABLED = True
+FLASH_REFLECTION_ENABLED = False
 
 # skill 执行器select
-FLASH_SKILL_POLICY = 2
+FLASH_SKILL_POLICY = 4
 # v1: 每轮 LLM 决策（类 ReAct）
 # v2: Plan-and-Execute
 # v3: Plan 冷启动 + 条件 ReAct
@@ -519,7 +519,7 @@ async def execution_flash(
             coordinator._metrics["total_skills_executed"] += 1
             continue
 
-        skill_output = await run_skill_policy2(
+        skill_output = await run_skill_policy4(
             coordinator,
             skill=skill,
             user_input=user_input,
@@ -1158,7 +1158,9 @@ async def run_skill_policy(
     executed: Set[str] = set()
     last_action = ""
     final_user_text = ""
-    synthesis_constraints = _extract_synthesis_constraints_regex(policy)
+    synthesis_constraints = _resolve_synthesis_constraints(
+        coordinator, skill_name=skill_name, policy=policy
+    )
 
     for turn in range(1, MAX_SKILL_TURNS + 1):
         context = build_policy_context(notes, RESULT_SNIPPET_LIMIT)
@@ -1462,6 +1464,44 @@ def _last_tool_status_from_notes(notes: List[str]) -> str:
     return ""
 
 
+def _normalize_condition_text(condition: str) -> str:
+    """Normalize condition phrasing so 不为空 ≠ 为空 substring trap."""
+    c = (condition or "").strip()
+    if not c:
+        return ""
+    # 先替换否定短语，避免「不为空」命中 fail 词「为空」
+    repl = (
+        ("不为空", "非空"),
+        ("不是空", "非空"),
+        ("非为空", "非空"),
+        ("没有为空", "非空"),
+        ("不能为空", "非空"),
+        ("不可为空", "非空"),
+        ("未为空", "非空"),
+        ("不失败", "成功"),
+        ("无失败", "成功"),
+        ("未失败", "成功"),
+        ("不是失败", "成功"),
+        ("没有失败", "成功"),
+        ("不存在失败", "成功"),
+        ("始终执行", "always"),
+        ("总是执行", "always"),
+        ("无条件", "always"),
+        ("必须执行", "always"),
+        ("依赖第一步", "有数据"),
+        ("依赖上一步", "有数据"),
+        ("基于上一步", "有数据"),
+        ("获取成功", "成功"),
+        ("调用成功", "成功"),
+        ("查询成功", "成功"),
+        ("分析结束", "always"),
+        ("流程结束", "always"),
+    )
+    for a, b in repl:
+        c = c.replace(a, b)
+    return c
+
+
 def _plan_condition_holds(condition: str, notes: List[str]) -> Optional[bool]:
     """Evaluate plan condition against recent notes.
 
@@ -1469,23 +1509,37 @@ def _plan_condition_holds(condition: str, notes: List[str]) -> Optional[bool]:
       True/False when recognized; None when phrasing unknown.
     Empty condition is not passed here (caller treats empty as unconditional).
     """
-    cond = (condition or "").strip()
-    if not cond:
+    cond_raw = (condition or "").strip()
+    if not cond_raw:
         return True
+    cond = _normalize_condition_text(cond_raw)
     cl = cond.lower()
     status = _last_tool_status_from_notes(notes)
     blob = "\n".join(notes[-6:])[:4000].lower()
 
+    # 明确「始终 / always」
+    if cl in ("always", "true", "yes", "1") or "always" in cl:
+        return True
+
+    # 成功类（含 非空 / 成功 / 有数据）优先于失败类，避免「不为空」误判
+    ok_markers = (
+        "有数据", "查到", "成功", "status=ok", "存在", "有效", "非空",
+        "不为空", "有结果", "已获取", "必要数据",
+    )
     fail_markers = (
         "无数据", "查询不到", "查不到", "为空", "empty", "未找到", "未查询",
         "没有数据", "无结果", "失败", "error", "无法", "不存在", "未匹配",
-    )
-    ok_markers = (
-        "有数据", "查到", "成功", "status=ok", "存在", "有效", "非空",
+        "获取失败", "调用失败",
     )
 
-    wants_fail = any(m in cond or m in cl for m in fail_markers)
-    wants_ok = any(m in cond or m in cl for m in ok_markers) and not wants_fail
+    wants_ok = any(m in cond or m in cl for m in ok_markers)
+    # 仅当出现「为空」且不是「非空」语境时才算 fail
+    wants_fail = False
+    if not wants_ok:
+        wants_fail = any(m in cond or m in cl for m in fail_markers)
+    else:
+        # 同时写了成功+失败时，以成功语义为主（如「成功且非空」）
+        wants_fail = False
 
     if wants_fail:
         if status in ("empty", "error"):
@@ -1636,7 +1690,9 @@ async def run_skill_policy2(
         session_history=session_history,
     )
     steps = plan.get("steps") or []
-    synthesis_constraints = _extract_synthesis_constraints_regex(policy)
+    synthesis_constraints = _resolve_synthesis_constraints(
+        coordinator, skill_name=skill_name, policy=policy
+    )
     if not steps:
         logger.warning("flash skill=%s empty plan; fallback tool order", skill_name)
         steps = _fallback_steps_from_skill(skill, allowed_tools)
@@ -1701,7 +1757,7 @@ async def run_skill_policy2(
             break
 
         if action == "analyze":
-            continue
+            # continue
             analysis = _analyze_under_plan(
                 coordinator,
                 skill_name=skill_name,
@@ -1825,7 +1881,9 @@ async def run_skill_policy3(
     )
     llm_calls = 1  # cold_start plan
     steps = list(plan.get("steps") or [])
-    synthesis_constraints = _extract_synthesis_constraints_regex(policy)
+    synthesis_constraints = _resolve_synthesis_constraints(
+        coordinator, skill_name=skill_name, policy=policy
+    )
     if not steps:
         logger.warning("flash v3 skill=%s empty plan; fallback tool order", skill_name)
         steps = _fallback_steps_from_skill(skill, allowed_tools)
@@ -2511,6 +2569,7 @@ async def run_skill_policy4(
     mcp_catalog: str,
     prior_results: str = "",
     session_history: str = "",
+    reflection: bool = False,
 ) -> str:
     """ ReAct：每轮 Thought→Action→Observation，无 cold-start plan；产出证据包。
 
@@ -2540,7 +2599,9 @@ async def run_skill_policy4(
     tools_text = "\n".join(allowed_catalog_lines) if allowed_catalog_lines else (
         "allowed tool names: " + ", ".join(allowed_tools)
     )
-    synthesis_constraints = _extract_synthesis_constraints_regex(policy)
+    synthesis_constraints = _resolve_synthesis_constraints(
+        coordinator, skill_name=skill_name, policy=policy
+    )
 
     notes: List[str] = []
     if session_history:
@@ -3028,14 +3089,42 @@ Action 仅可：
     )
 
 
+# 前置 skill：只做实体/规范确认，不产出业务报告模板 → 不抽 synthesis_constraints
+_PREREQ_SKILL_NAMES = frozenset({
+    "norm-answers",
+    "norm_answers",
+    "normanswers",
+})
+
 # Skill 成文约束标题：匹配到则截取到下一同级/上级标题或文末；匹配不到返回空
 _CONSTRAINT_HEADING_RE = re.compile(
     r"(?m)^[ \t]{0,3}#{1,3}[ \t]+("
-    r"注意事项|注意|输出要求|输出格式|最终报告|报告要求|"
-    r"写作要求|成文要求|禁止事项|约束|规范"
+    r"注意事项|注意|输出要求|输出格式|最终报告|报告要求|报告结构|"
+    r"写作要求|成文要求|禁止事项|约束|规范|"
+    r"Output|Rules|Template|模板|输出|规则"
     r")[ \t]*$"
 )
 _NEXT_HEADING_RE = re.compile(r"(?m)^[ \t]{0,3}#{1,3}[ \t]+\S")
+# 正文中出现的模板/内容要求关键词（无 ## 标题时的兜底探测）
+_TEMPLATE_HINT_RE = re.compile(
+    r"(输出格式|报告包含|报告结构|写作要求|成文要求|注意事项|"
+    r"不得臆造|不要编造|Output|Rules|Template|"
+    r"必须基于|禁止|优先级\s*P[1-4])",
+    re.I,
+)
+
+
+def _is_prereq_skill(skill_name: str) -> bool:
+    n = (skill_name or "").strip().lower().replace("_", "-")
+    if n in _PREREQ_SKILL_NAMES or n.replace("-", "") in {
+        x.replace("-", "").replace("_", "") for x in _PREREQ_SKILL_NAMES
+    }:
+        return True
+    # 名称含 norm + answer 的前置规范 skill
+    compact = n.replace("-", "").replace("_", "")
+    if "norm" in compact and "answer" in compact:
+        return True
+    return False
 
 
 def _extract_synthesis_constraints_regex(policy: str, *, max_chars: int = 1200) -> str:
@@ -3069,6 +3158,101 @@ def _extract_synthesis_constraints_regex(policy: str, *, max_chars: int = 1200) 
     if len(joined) > max_chars:
         joined = joined[:max_chars] + "\n...(constraints truncated)"
     return joined
+
+
+def _skill_has_output_or_rules(policy: str) -> bool:
+    """非空 skill 是否含 Output/Rules/模板类内容要求。"""
+    text = (policy or "").strip()
+    if not text:
+        return False
+    if _CONSTRAINT_HEADING_RE.search(text):
+        return True
+    if _TEMPLATE_HINT_RE.search(text):
+        return True
+    return False
+
+
+def _llm_distill_synthesis_constraints(
+    coordinator: Any,
+    *,
+    skill_name: str,
+    policy: str,
+    max_chars: int = 1200,
+) -> str:
+    """用 LLM 从 Skill 中提炼「成文内容结构 + 规则」条目，供 generate_context。"""
+    raw_snip = (policy or "").strip()
+    if not raw_snip:
+        return ""
+    # 优先把正则截到的段落给 LLM，减少噪声
+    section = _extract_synthesis_constraints_regex(raw_snip, max_chars=2500)
+    src = section if section else raw_snip[:4000]
+    prompt = f"""你是 Skill 成文约束提炼器。从下列 Skill 片段中提取「最终回答必须遵守」的内容结构与规则。
+只输出可执行约束，不要 Workflow 取数步骤、不要工具名列表、不要解释。
+
+Skill: {skill_name}
+
+Skill 片段:
+{src}
+
+要求：
+1. 若有 Output/报告结构：逐条列出报告必须包含的章节/字段。
+2. 若有 Rules/注意事项：逐条列出禁止项与必须项。
+3. 中文条目列表（- 开头），合计不超过 800 字。
+4. 无实质约束则只输出 EMPTY。
+5. 不要 markdown 代码块，不要 JSON。
+"""
+    try:
+        out = (coordinator.llm_client.invoke(prompt, temperature=0.1, max_tokens=900) or "").strip()
+    except Exception as e:
+        logger.warning("llm distill synthesis_constraints failed skill=%s: %s", skill_name, e)
+        return ""
+    if not out or out.upper() == "EMPTY" or out.strip() == "EMPTY":
+        return ""
+    # 去掉偶发 fence
+    if out.startswith("```"):
+        out = re.sub(r"^```\w*\n?", "", out)
+        out = re.sub(r"\n?```$", "", out).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars] + "\n...(constraints truncated)"
+    return out
+
+
+def _resolve_synthesis_constraints(
+    coordinator: Any,
+    *,
+    skill_name: str,
+    policy: str,
+) -> str:
+    """非前置 skill：检测 Output/Rules/模板要求 → LLM 提炼 → 写入 synthesis_constraints。
+
+    前置 skill（如 norm-answers）返回空。
+    无模板/规则段落时返回空（不浪费 LLM）。
+    LLM 失败时回退正则截取。
+    """
+    if _is_prereq_skill(skill_name):
+        return ""
+    if not _skill_has_output_or_rules(policy):
+        return ""
+    distilled = _llm_distill_synthesis_constraints(
+        coordinator,
+        skill_name=skill_name,
+        policy=policy,
+    )
+    if distilled:
+        logger.info(
+            "flash synthesis_constraints skill=%s source=llm chars=%d",
+            skill_name,
+            len(distilled),
+        )
+        return distilled
+    fallback = _extract_synthesis_constraints_regex(policy)
+    if fallback:
+        logger.info(
+            "flash synthesis_constraints skill=%s source=regex chars=%d",
+            skill_name,
+            len(fallback),
+        )
+    return fallback
 
 
 def _build_skill_evidence_package(
