@@ -8,6 +8,7 @@ from langchain_core.tools import BaseTool
 
 from .config import Config
 from .context import AgentContext
+from .langchain import reflection
 from .llm_client import LLMClient
 from .token_budget import TokenBudget
 from .planner import Planner
@@ -18,7 +19,7 @@ from .tools import ToolRegistry, create_default_registry
 from utils.skill_loader import SkillRegistry,SkillLoader, Skill
 from app.gateway.config import settings
 from agent.memory.redis_memory import memoryRedis
-from agent.langchain.llm import generate_context,generate_intents
+from agent.langchain.llm import generate_context,generate_intents, generate_reflection, generate_refine
 # from agent.langchain.prompt import INTENT_PROMPT
 from .errors import AgentError, ExecutorError
 from dotenv import load_dotenv
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 # 0--rasa, 1--LLM
 INTENT_TYPE = 1
+
+# 是否开启反思
+IS_REFLECTION = True
+# 反思最高轮次
+max_iterations = 2
 
 class Coordinator:
     """Main orchestration coordinator for Agent Skills Framework.
@@ -206,13 +212,29 @@ class Coordinator:
             if mode_norm == "flash":
                 result = await self._execution_flash(session_id, user_input)
             else:
+                # 看需要执行哪些mcp
                 result = await self._plan_execution(session_id, user_input)
 
+            # mcp的结果，让大模型生成报告
             final_response = generate_context(
                 result,
                 memory_context=memory_context,
                 user_input=user_input,
             )
+            if IS_REFLECTION:
+                for i in range(max_iterations):
+                    logger.info(f"第 {i} 轮 迭代")
+                    # 反思
+                    reflection_info = generate_reflection(final_response)
+
+                    if reflection_info["is_sufficient"] is None:
+                        break
+                    if reflection_info["is_sufficient"] is not None and reflection_info["is_sufficient"]:
+                        break
+                    if reflection_info["additional_adjusts"] is None:
+                        break
+                    # 优化
+                    final_response = generate_refine(result, final_response, reflection_info["additional_adjusts"])
 
             # 会话储存（redis）
             message_store.append_assistant(session_id, final_response)

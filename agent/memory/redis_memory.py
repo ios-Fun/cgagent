@@ -5,7 +5,7 @@ from typing import Annotated, Any, TypedDict, get_args, Optional, Dict
 
 
 REDIS_CONF = {
-    "host": "192.168.0.58",
+    "host": "192.168.0.106",
     "port": 6379,
     "db": 0,
     "password": "mypassword",

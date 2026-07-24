@@ -2,6 +2,7 @@ from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from agent.langchain.refine import REFINE_PROMPT
 from agent.yaml_settings import get_section
 from langchain_core.output_parsers import JsonOutputParser
 import logging
@@ -9,8 +10,7 @@ from langfuse import Langfuse
 
 from agent.langchain.prompt import PLAN_PROMPT
 from langfuse.langchain import CallbackHandler
-
-
+from agent.langchain.reflection import REFLECTION_PROMPT
 langfuse = Langfuse(
     public_key="pk-lf-ff61ea39-d357-4614-a204-04346e964542",
     secret_key="sk-lf-896d4499-98d4-4e72-8502-eefc0cc2875c",
@@ -96,8 +96,10 @@ def generate_context(
         HumanMessage(content=human),
     ]
     try:
-        langfuse_handler = CallbackHandler()
-        response = llm.invoke(messages,config={"callbacks": [langfuse_handler]})
+        # langfuse_handler = CallbackHandler()
+        # response = llm.invoke(messages,config={"callbacks": [langfuse_handler]})
+        response = llm.invoke(messages)
+
         return response.content
     except Exception as e:
         print(f"调用 LLM 失败：{e}")
@@ -149,3 +151,33 @@ def generate_intents(system_prompt:str, user_content: str) -> list:
     except Exception as e:
         print(f"调用 LLM 失败：{e}")
         return "调用 LLM 失败"
+
+# 生成反思
+def generate_reflection(report:str) -> dict:
+    cfg = _synthesis_settings()
+    llm = _build_chat_model(cfg)
+    prompt_content = REFLECTION_PROMPT.format(report=report)
+    messages = [
+        SystemMessage(content=prompt_content)
+    ]
+    try:
+        parser = JsonOutputParser()
+        langfuse_handler = CallbackHandler()
+        response = llm.invoke(messages, config={"callbacks": [langfuse_handler]})
+        logger.info("llm generate_reflection: %s", response.content)
+        data = parser.parse(response.content)
+        return data
+    except Exception as e:
+        print(f"调用 LLM 失败：{e}")
+        return "调用 LLM 失败"
+    
+# 再次优化生成
+def generate_refine(task:str, report:str, feedback:str) -> str:
+    cfg = _synthesis_settings()
+    llm = _build_chat_model(cfg)
+    prompt_content = REFINE_PROMPT.format(task=task ,report=report, feedback=feedback)
+    messages = [
+        SystemMessage(content=prompt_content)
+    ]
+    response = llm.invoke(messages)
+    return response.content
