@@ -16,6 +16,9 @@ langfuse = Langfuse(
     secret_key="sk-lf-896d4499-98d4-4e72-8502-eefc0cc2875c",
     host="http://localhost:3010"
 )
+
+LOAD_MEMORY = False
+
 logger = logging.getLogger(__name__)
 def _synthesis_settings() -> dict:
     synth = get_section("synthesis_llm")
@@ -77,9 +80,11 @@ def generate_context(
     cfg = _synthesis_settings()
     llm = _build_chat_model(cfg)
 
-    system_content = (system_prompt or str(cfg["system_template"])).strip()
-    if memory_context and memory_context.strip():
-        system_content = f"{system_content}\n\n{memory_context.strip()}"
+    # system_content = (system_prompt or str(cfg["system_template"])).strip()
+    system_content = system_prompt
+    if LOAD_MEMORY and memory_context and memory_context.strip():
+        system_content = f"{system_prompt}\n\n{memory_context.strip()}"
+    logger.info(f"system_content: {system_content}")
 
     if user_input and user_input.strip():
         human = (
@@ -90,6 +95,7 @@ def generate_context(
         )
     else:
         human = context or ""
+    logger.info(f"human: {human}")
 
     messages = [
         SystemMessage(content=system_content),
@@ -129,6 +135,22 @@ def generate_mcp_plans(workflow_content:str) -> list:
     except Exception as e:
         print(f"调用 LLM 失败：{e}")
         return "调用 LLM 失败"
+
+# 多意图
+def generate_multiintents(system_prompt:str, user_content: str) -> list:
+    cfg = _synthesis_settings()
+    llm = _build_chat_model(cfg)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_content),
+    ]
+    parser = JsonOutputParser()
+    langfuse_handler = CallbackHandler()
+    response = llm.invoke(messages, config={"callbacks": [langfuse_handler]})
+    logger.info("llm generate_multiintents: %s", response.content)
+    data = parser.parse(response.content)
+    list = data["rewritten_queries"]
+    return list
 
 # 用大模型做意图识别
 def generate_intents(system_prompt:str, user_content: str) -> list:

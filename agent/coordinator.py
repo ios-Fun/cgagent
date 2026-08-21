@@ -4,8 +4,11 @@ import time
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
+from fastapi import params
 from langchain_core.tools import BaseTool
 
+
+from rasa.intent_call import parseIntents
 from .config import Config
 from .context import AgentContext
 from .langchain import reflection
@@ -19,7 +22,7 @@ from .tools import ToolRegistry, create_default_registry
 from utils.skill_loader import SkillRegistry,SkillLoader, Skill
 from app.gateway.config import settings
 from agent.memory.redis_memory import memoryRedis
-from agent.langchain.llm import generate_context,generate_intents, generate_reflection, generate_refine
+from agent.langchain.llm import generate_context,generate_intents, generate_reflection, generate_refine, generate_multiintents
 # from agent.langchain.prompt import INTENT_PROMPT
 from .errors import AgentError, ExecutorError
 from dotenv import load_dotenv
@@ -30,15 +33,19 @@ import json
 import uuid
 from agent.sql.pgsql import execute_sql
 from psycopg import sql
+from rasa.rasa_intent import RasaIntent
 logger = logging.getLogger(__name__)
 
 # 0--rasa, 1--LLM
 INTENT_TYPE = 1
 
 # 是否开启反思
-IS_REFLECTION = True
+IS_REFLECTION = False
 # 反思最高轮次
 max_iterations = 2
+
+# 是否开启注入json
+INJECT_JSON = True
 
 class Coordinator:
     """Main orchestration coordinator for Agent Skills Framework.
@@ -52,6 +59,7 @@ class Coordinator:
 
     # Process-level singleton: avoid re-creating LLM client + re-scanning skills every request
     _shared: Optional["Coordinator"] = None
+    _mcp_tools_cache = []
 
     def __init__(self, config: Config):
         """Initialize Coordinator.
@@ -209,18 +217,37 @@ class Coordinator:
             #   flash   -> multi-skill plan + executor
             #   default -> Rasa routing
             mode_norm = (mode or "default").lower()
+            first_skill = None
+            incident_list = None
             if mode_norm == "flash":
                 result = await self._execution_flash(session_id, user_input)
             else:
-                # 看需要执行哪些mcp
-                result = await self._plan_execution(session_id, user_input)
+                result_tuple = await self._plan_execution(session_id, user_input)
+                result = result_tuple[0]
+                first_skill = result_tuple[1]
+                incident_list = result_tuple[2]
+                # 测试： 看需要执行哪些mcp
+                # list = await self.multi_intent(session_id, user_input)
+                # return {'final_response': list}
 
             # mcp的结果，让大模型生成报告
             final_response = generate_context(
                 result,
                 memory_context=memory_context,
                 user_input=user_input,
+                system_prompt=first_skill.prompt
             )
+
+            if INJECT_JSON:
+                # 每个诊断单，部分内容固定，加部分大模型生成
+                logger.info("Injected JSON")
+                marker = "\n## 3. 运行风险评估\n"
+                parts = final_response.split(marker, 1)
+                if len(parts) == 2:
+                    json_result = await self.generate_json_inject(incident_list)
+                    # 插入到合适的位置
+                    final_response = parts[0] + json_result + marker + parts[1]
+
             if IS_REFLECTION:
                 for i in range(max_iterations):
                     logger.info(f"第 {i} 轮 迭代")
@@ -274,6 +301,124 @@ class Coordinator:
             if name and tool_name_matches(mcp_name, name):
                 return mcp
         return None
+
+    async def multi_intent(self, session_id: str, user_input: str):
+        logger.info("multi_intent")
+        system_prompt = f"""
+        你是一个专业的语义拆分专家。你的任务是基于用户当前输入，判断是否需要拆分语义，并进行拆分。
+
+# Instructions
+1. **分析意图**：判断用户输入的是独立问题、追问、还是包含多个子问题。
+2. **多意图拆分**：如果用户一次问了两个不同领域的问题（例如“RAGFlow怎么部署？另外今天天气如何？”），请拆分为两个独立的查询。
+3. **保持原义**：尽量不要修改原文，拆分时也保持原有语句部分。
+4. **不要回答**：绝对不要回答用户的问题，只负责重写。
+
+# Output Format
+必须严格输出 JSON 格式，不要包含任何额外文字：
+{{
+    "rewritten_queries": ["高压跳闸电磁阀活动试验过程中，母管安全油压最大、最小值各为多少？", "拆分后的查询语句2", "拆分后的查询语句3"...]
+}}
+
+比如：高压跳闸电磁阀活动试验过程中，母管安全油压最大、最小值各为多少？是否正常？
+输出
+{{
+    "rewritten_queries": ["高压跳闸电磁阀活动试验过程中，母管安全油压最大、最小值各为多少？", "是否正常？"]
+}}
+                    """
+
+        result = generate_multiintents(system_prompt, user_input)
+        if result is not None and len(result) > 0:
+            url = 'http://192.168.0.106:5005/webhooks/rest/webhook'
+            deerflow_load = False
+            # 意图的封装
+            intent_list = []
+            for intent in result:
+                # 调用rasa得到意图数组
+                body = {"sender": 'sender001', "message": intent}
+                response = requests.post(url, json=body)
+                intent_result = response.json()
+                logging.info(f"response: {intent_result}")
+
+
+                if len(intent_result) > 0:
+                    intent_value = int(intent_result[0]["text"])
+
+                    params = None
+                    if len(intent_result) > 1:
+                        params = intent_result[1]["custom"]
+                    obj = RasaIntent(intent, intent_value, params)
+                    if intent_value == 1 or intent_value == 2:
+                        deerflow_load = True
+                else:
+                    obj = RasaIntent(intent, None, None)
+                intent_list.append(obj)
+            # 判断下有没有机组健康，设备健康的意图，有则调用deerflow
+            if deerflow_load:
+                logger.info("deerflow_load")
+            else:
+                logger.info("no deerflow_load")
+                # 否则，根据rasa的参数调用mcp或者java接口
+
+                parseIntents(intent_list)
+        return result
+
+    # 生成json注入的内容
+    async def generate_json_inject(self, incident_list:list):
+        logger.info("generate_json_inject")
+        result = "\n\n### 故障模式及原因分析\n"
+        # from mcp.mcptools import get_mcp_tools
+        # self._mcp_tools_cache = await get_mcp_tools()
+        prompt = '''
+        你是一名资深电力行业设备智能诊断专家，对该诊断单内容进行分析，以markdown格式，4级标题开始，输出300字左右
+        '''
+        for item in incident_list:
+            incident_id = item["incidentId"]
+            name = item["maxDefectSeverityName"]
+            title_str = f"\n#### 【诊断单ID: {incident_id}】 {name}\n"
+            result += title_str
+            json_str = f'''
+            ```json{{
+  "type": "fault_analysis",
+  "version": "1.0",
+  "incidentId": {incident_id}
+}}
+```
+            '''
+            result += json_str
+            result += '\n'
+
+            llm_input = f"{item}\n"
+            # 调用mcp的结果
+            incident_id_list = [incident_id]
+            params = {"incident_ids" : incident_id_list, "thread_id":"1", "unit_id":805126}
+            mcp_tool1 = self.find_mcp("mcp-device-sse_unit_mount_path", self._mcp_tools_cache)
+            mcp_tool2 = self.find_mcp("mcp-device-sse_unit_graph_show", self._mcp_tools_cache)
+            mcp_tool3 = self.find_mcp("mcp-device-sse_unit_tags_realtime", self._mcp_tools_cache)
+            call_tool_result1 = await mcp_tool1.ainvoke(input=params)
+            llm_input += str(call_tool_result1)
+            llm_input += '\n'
+            call_tool_result2 = await mcp_tool2.ainvoke(input=params)
+            llm_input += str(call_tool_result2)
+            llm_input += '\n'
+            call_tool_result3 = await mcp_tool3.ainvoke(input=params)
+            llm_input += str(call_tool_result3)
+            llm_input += '\n'
+            # 大模型生成的结果
+            final_response = generate_context(
+                llm_input,
+                memory_context=None,
+                user_input=None,
+                system_prompt=prompt
+            )
+            result += final_response
+
+            result += '\n'
+            logger.info(f"generate_json_inject result: {final_response}")
+        logger.info(f"final result: {result}")
+        return result
+
+
+    # 计划-- 执行功能
     async def _plan_execution(self, session_id: str, user_input: str):
         """Generate execution plan.
 
@@ -330,10 +475,15 @@ class Coordinator:
             logging.warning(f"no skills found")
             return "todo：默认处理"
 
+        # 提取诊断单id参数
+        incident_id_list = []
+        incident_list = []
 
         # 将结果拼接到字符串
         result = ""
-        # 遍历意图对应的skill
+        # 首个加载skill
+        first_skill = None
+
         for index in indexList:
             loadSkill = settings.SKILLS[indexList[index-1]]
             logging.info(f"loadSkill: {loadSkill}")
@@ -341,35 +491,40 @@ class Coordinator:
             skill_md = skill_dir / "SKILL.md"
 
             skill = SkillRegistry.get_instance().get_skill(loadSkill)
+            if first_skill is None:
+                first_skill = skill
             skill.load_mcps()
             logging.info(f"skill: {skill}")
 
             from agent.mcp.mcptools import get_mcp_tools
 
             logger.info("Initializing MCP tools...")
-            _mcp_tools_cache = await get_mcp_tools()
-
+            self._mcp_tools_cache = await get_mcp_tools()
 
             # 遍历skill里设置的mcp
             for mcp in skill.tools:
                 logger.info(f"mcp: {mcp}")
-                mcp_tool = self.find_mcp(mcp.strip(), _mcp_tools_cache)
+                mcp_tool = self.find_mcp(mcp.strip(), self._mcp_tools_cache)
                 call_tool_result = None
-                if mcp.endswith("cg_device_healthy") :
+                if mcp.endswith("cg_device_healthy") or mcp.endswith("cg_unit_healthy_v2") or mcp.endswith("unit_alarm_list_statistics_v2"):
                     call_tool_result = await mcp_tool.ainvoke(input={"orginal": user_input, "thread_id": session_id})
                 else:
                     # 查看mcp的参数
                     logger.info(f"mcp: {mcp}")
                     args = mcp_tool.args
-                    params = {}
+                    params = {"unit_id":805126}
                     for key in args.keys():
                         if key == "thread_id":
                             params[key] = session_id
                         else:
-                            redis_key = f"{session_id}_{key}"
-                            if memoryRedis.has_key(redis_key):
-                                value = memoryRedis.get_cache(redis_key)
-                                params[key] = value
+                            if loadSkill.endswith("unit-healthy"):
+                                params["incident_ids"] = incident_id_list
+                            else:
+                                redis_key = f"{session_id}_{key}"
+                                if memoryRedis.has_key(redis_key):
+                                    value = memoryRedis.get_cache(redis_key)
+                                    params[key] = value
+                    logger.info(f"params: {params}")
                     call_tool_result = await mcp_tool.ainvoke(input=params)
 
                 logger.info(f"result1: {call_tool_result}")
@@ -383,6 +538,11 @@ class Coordinator:
                     logger.warning(f"json_result is None:{e}")
                     json_result = None
                 if json_result is not None:
+                    if mcp.endswith("cg_unit_healthy_v2"):
+                        for item in json_result["data"]:
+                            incident_list = item["incidents"]
+                            for incident in item["incidents"]:
+                                incident_id_list.append(incident["incidentId"])
 
                     if len(json_result) == 0:
                         logger.warn("json_result is 0")
@@ -404,7 +564,7 @@ class Coordinator:
                     result += text_result
                 result += "\n"
         logger.info(f"result: {result}")
-        return result
+        return result, first_skill, incident_list
 
     def _format_skills(self, available_skills: Dict) -> str:
         """Format available skills for prompt."""
@@ -417,6 +577,8 @@ class Coordinator:
                 # f"  Tags: {', '.join(skill.tags)}"
             )
         return "\n".join(lines)
+
+
 
     async def _execution_flash(self, session_id: str, user_input: str) -> str:
         from agent.modes.flash import execution_flash

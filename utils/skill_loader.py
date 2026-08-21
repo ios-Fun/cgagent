@@ -179,8 +179,24 @@ class SkillLoader:
         print(f"SkillLoader: Discovered {discovered_count} skill(s)")
         return self._skills
 
+    def extract_md_section_v2(self, md_text: str, target: str) -> str:
+        lines = md_text.splitlines()
+        start_idx = None
+        end_idx = None
+
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == f"# {target}":
+                start_idx = idx
+            if stripped == "# Workflow":
+                end_idx = idx
 
 
+        if start_idx is None or end_idx is None or end_idx <= start_idx:
+            return ""
+        content_lines = lines[start_idx + 1: end_idx]
+        content = "\n".join(content_lines).strip()
+        return content
 
     def extract_md_section(self, md_text: str, target: str) -> str:
         """Extract section under # / ## / ### title matching target (exact or contains).
@@ -255,9 +271,9 @@ class SkillLoader:
 
         # 章节：兼容 # Workflow / ## 工作流程 (Workflow) 等
         prompt_content = (
-            self.extract_md_section(md_body, "Prompt")
-            or self.extract_md_section(md_body, "角色")
-            or self.extract_md_section(md_body, "目标")
+            self.extract_md_section_v2(md_body, "Prompt")
+            or self.extract_md_section_v2(md_body, "角色")
+            or self.extract_md_section_v2(md_body, "目标")
         )
         workflow_content = (
             self.extract_md_section(md_body, "Workflow")
