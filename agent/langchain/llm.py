@@ -48,13 +48,24 @@ def _build_chat_model(cfg: dict) -> Any:
         "model": cfg["model"],
         "temperature": cfg["temperature"],
     }
+    # if provider == "ollama":
+    #     from langchain_ollama import ChatOllama
+    #
+    #     return ChatOllama(
+    #         **common,
+    #         base_url=cfg["base_url"],
+    #         max_tokens=cfg["max_tokens"],
+    #     )
+    # el
     if provider == "ollama":
-        from langchain_ollama import ChatOllama
-
-        return ChatOllama(
-            **common,
-            base_url=cfg["base_url"],
-            max_tokens=cfg["max_tokens"],
+        from langchain_deepseek import ChatDeepSeek
+        return ChatDeepSeek(
+            api_key = "sk-29fe078babe448018e2926aa5e247fc0",
+            model = "deepseek-v4-flash",
+            temperature=0.7,
+            max_tokens=None,
+            timeout=None,
+            max_retries=2
         )
 
     # openai / deepseek / zhipu 等 OpenAI 兼容接口
@@ -87,12 +98,13 @@ def generate_context(
     logger.info(f"system_content: {system_content}")
 
     if user_input and user_input.strip():
-        human = (
-            f"# 用户问题\n{user_input.strip()}\n\n"
-            f"# 参考内容（skill 执行结果 / 工具数据，请据此回答；勿编造）\n"
-            f"{(context or '').strip() or '(无参考内容)'}\n\n"
-            "请综合以上参考内容，直接用专业中文回答用户问题。"
-        )
+        # human = (
+        #     f"# 用户问题\n{user_input.strip()}\n\n"
+        #     f"# 参考内容（skill 执行结果 / 工具数据，请据此回答；勿编造）\n"
+        #     f"{(context or '').strip() or '(无参考内容)'}\n\n"
+        #     "请综合以上参考内容，直接用专业中文回答用户问题。"
+        # )
+        human = context or ""
     else:
         human = context or ""
     logger.info(f"human: {human}")
@@ -165,6 +177,7 @@ def generate_intents(system_prompt:str, user_content: str) -> list:
     try:
         parser = JsonOutputParser()
         langfuse_handler = CallbackHandler()
+        logger.info(f"generate_intents: {user_content}")
         response = llm.invoke(messages, config={"callbacks": [langfuse_handler]})
         logger.info("llm generate_intents: %s", response.content)
         data = parser.parse(response.content)

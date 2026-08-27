@@ -238,15 +238,21 @@ class Coordinator:
                 system_prompt=first_skill.prompt
             )
 
+            logger.info(f"final_response: {final_response}")
+
             if INJECT_JSON:
                 # 每个诊断单，部分内容固定，加部分大模型生成
                 logger.info("Injected JSON")
-                marker = "\n## 3. 运行风险评估\n"
-                parts = final_response.split(marker, 1)
-                if len(parts) == 2:
-                    json_result = await self.generate_json_inject(incident_list)
-                    # 插入到合适的位置
-                    final_response = parts[0] + json_result + marker + parts[1]
+
+                split_list = ["## 3. 运行风险评估", "## 三. 运行风险评估", "## 3、 运行风险评估", "## 三、 运行风险评估", "## 4. 运行风险评估", "## 四. 运行风险评估", "## 4、 运行风险评估", "## 四、 运行风险评估", ]
+                for item in split_list:
+                    result = self.has_part(final_response, item)
+                    if result is not None:
+                        parts = result[0]
+                        logger.info(f"result[1]: {result[1]}")
+                        json_result = await self.generate_json_inject(incident_list)
+                        final_response = parts[0] + json_result + result[1] + parts[1]
+                        break
 
             if IS_REFLECTION:
                 for i in range(max_iterations):
@@ -293,6 +299,12 @@ class Coordinator:
                 "error": str(e)
             }
 
+    def has_part(self, text, target):
+        parts = text.split(target, 1)
+        if len(parts) == 2:
+            return parts, target
+        else:
+            return None
     # 查找mcp
     def find_mcp(self, mcp_name: str, mcp_tools_cache: list) -> Optional[BaseTool]:
         from agent.modes.common import tool_name_matches
@@ -369,7 +381,7 @@ class Coordinator:
         # from mcp.mcptools import get_mcp_tools
         # self._mcp_tools_cache = await get_mcp_tools()
         prompt = '''
-        你是一名资深电力行业设备智能诊断专家，对该诊断单内容进行分析，以markdown格式，4级标题开始，输出300字左右
+        你是一名资深电力行业设备智能诊断专家，对该诊断单内容进行分析，以markdown格式，5级标题开始，输出300字左右
         '''
         for item in incident_list:
             incident_id = item["incidentId"]
@@ -377,7 +389,7 @@ class Coordinator:
             title_str = f"\n#### 【诊断单ID: {incident_id}】 {name}\n"
             result += title_str
             json_str = f'''
-            ```json{{
+            ```json\n{{
   "type": "fault_analysis",
   "version": "1.0",
   "incidentId": {incident_id}

@@ -24,6 +24,7 @@ dependencies = [
     "langchain-openai>=0.3.0",
     "langfuse",
     "langchain",
+    "langchain_deepseek"
 ]
 
 [tool.uv]
